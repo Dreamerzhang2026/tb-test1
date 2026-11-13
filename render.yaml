@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: tvbox-legado-aggregator
+    env: docker
+    plan: free
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: ACCESS_PASSWORD
+        sync: false
+      - key: UPDATE_INTERVAL_DAYS
+        value: "7"
+      - key: DATA_DIR
+        value: data
+    healthCheckPath: /

@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TVBox + Legado 源聚合器</title>
+<style>
+*{box-sizing:border-box}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}
+.wrap{max-width:720px;margin:0 auto;padding:24px 16px 48px}
+h1{font-size:22px;margin:8px 0 4px}.sub{color:#94a3b8;font-size:14px;line-height:1.6}
+.card{background:#1e293b;border:1px solid #334155;border-radius:14px;padding:18px;margin-top:16px}
+input,button{font-size:16px;border-radius:10px;border:1px solid #475569}
+input{width:100%;padding:12px;background:#0f172a;color:#fff;outline:none}
+input:focus{border-color:#38bdf8}
+button{padding:11px 16px;background:#0284c7;color:#fff;border:none;cursor:pointer}
+button:disabled{opacity:.5;cursor:not-allowed}
+button.ghost{background:transparent;border:1px solid #475569}
+button.danger{background:#b91c1c}
+.row{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}
+.stat{background:#0f172a;border:1px solid #334155;border-radius:10px;padding:12px}
+.stat b{font-size:22px;display:block}.stat span{color:#94a3b8;font-size:13px}
+table{width:100%;border-collapse:collapse;font-size:14px;margin-top:8px}
+td,th{padding:8px 4px;border-bottom:1px solid #334155;text-align:left;word-break:break-all}
+th{color:#94a3b8;font-weight:400}
+a.dl{color:#38bdf8;text-decoration:none}
+.err{color:#fca5a5;margin-top:10px;font-size:14px}
+.ok{color:#86efac}
+pre.log{background:#020617;border:1px solid #334155;border-radius:10px;padding:12px;max-height:300px;overflow:auto;font-size:12px;line-height:1.6;white-space:pre-wrap;word-break:break-all}
+.muted{color:#94a3b8;font-size:13px;line-height:1.6}
+.hidden{display:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>📺📚 TVBox + Legado 源聚合器</h1>
+  <p class="sub">定时抓取 TVBox 聚合源与 Legado 书源，登录后可查看、下载、手动更新。</p>
+
+  <div id="loginCard" class="card">
+    <h2 style="font-size:17px;margin:0 0 12px">请输入访问密码</h2>
+    <input id="pwd" type="password" placeholder="访问密码" autocomplete="current-password">
+    <div class="row"><button id="loginBtn" onclick="login()">登录</button></div>
+    <div id="loginErr" class="err"></div>
+    <p class="muted">密码由部署时的环境变量 ACCESS_PASSWORD 配置，默认 change-me（请务必修改）。密码只发给服务端校验，不会写进页面代码。</p>
+  </div>
+
+  <div id="mainCard" class="hidden">
+    <div class="card">
+      <div class="grid">
+        <div class="stat"><b id="tvCount">-</b><span>TVBox 站点数</span></div>
+        <div class="stat"><b id="bookCount">-</b><span>Legado 书源数</span></div>
+        <div class="stat"><b id="lastUpd" style="font-size:14px">-</b><span>上次更新</span></div>
+        <div class="stat"><b id="nextUpd" style="font-size:14px">-</b><span>下次更新</span></div>
+      </div>
+      <div class="row">
+        <button onclick="triggerUpdate()" id="updBtn">🔄 手动更新抓取</button>
+        <button class="ghost" onclick="downloadAll()">⬇️ 全部下载为 ZIP</button>
+        <button class="ghost" onclick="logout()">退出登录</button>
+      </div>
+      <p class="muted" id="updHint">手动更新会重新从上游抓取，可能需要 1-3 分钟，期间请勿重复点击。</p>
+      <div id="progBox" class="hidden">
+        <p id="progState">正在抓取…</p>
+        <pre class="log" id="progLog"></pre>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2 style="font-size:17px;margin:0">文件列表</h2>
+      <table><thead><tr><th>文件</th><th>大小</th><th>更新时间</th><th></th></tr></thead>
+      <tbody id="fileRows"><tr><td colspan="4" class="muted">加载中…</td></tr></tbody></table>
+      <p class="muted">tvbox.json 直接导入 TVBox 使用；books.json 直接导入阅读 App（Legado）使用；meta.json 记录每个上游的抓取结果。</p>
+    </div>
+  </div>
+</div>
+<script>
+let pollTimer=null;
+function fmt(n){return n==null?'—':n.toLocaleString()}
+function fmtTime(s){if(!s)return '—';try{return new Date(s).toLocaleString('zh-CN',{hour12:false})}catch(e){return s}}
+function fmtSize(n){if(n<1024)return n+' B';if(n<1048576)return (n/1024).toFixed(1)+' KB';return (n/1048576).toFixed(2)+' MB'}
+async function api(path,opt){const r=await fetch(path,opt);if(r.status===401){showLogin();throw new Error('未登录')}return r}
+async function refresh(){
+  try{
+    const s=await (await api('/api/status')).json();
+    document.getElementById('tvCount').textContent=fmt(s.tvbox_sites);
+    document.getElementById('bookCount').textContent=fmt(s.book_sources);
+    document.getElementById('lastUpd').textContent=fmtTime(s.last_update);
+    document.getElementById('nextUpd').textContent=fmtTime(s.next_update);
+    const f=await (await api('/api/files')).json();
+    const rows=(f.files||[]).map(x=>{
+      const dl=x.name==='tvbox/tvbox.json'?'tvbox.json':x.name==='books/books.json'?'books.json':x.name==='tvbox/meta.json'?'tvbox-meta.json':x.name==='books/meta.json'?'books-meta.json':'status.json';
+      return `<tr><td>${x.name}</td><td>${fmtSize(x.size)}</td><td>${fmtTime(x.mtime)}</td><td><a class="dl" href="/api/download/${dl}">下载</a></td></tr>`;
+    }).join('')||'<tr><td colspan="4">暂无文件，请先手动更新</td></tr>';
+    document.getElementById('fileRows').innerHTML=rows;
+    if(s.updating) startPolling(); else stopPolling();
+  }catch(e){/* 已回登录页 */}
+}
+function showLogin(){document.getElementById('loginCard').classList.remove('hidden');document.getElementById('mainCard').classList.add('hidden')}
+function showMain(){document.getElementById('loginCard').classList.add('hidden');document.getElementById('mainCard').classList.remove('hidden')}
+async function login(){
+  const pwd=document.getElementById('pwd').value;
+  const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pwd})});
+  if(r.ok){document.getElementById('loginErr').textContent='';showMain();refresh();}
+  else{document.getElementById('loginErr').textContent='密码错误，请重试';}
+}
+async function logout(){await fetch('/api/logout',{method:'POST'});showLogin()}
+function downloadAll(){window.location='/api/download-all'}
+async function triggerUpdate(){
+  const b=document.getElementById('updBtn');b.disabled=true;
+  const r=await fetch('/api/update',{method:'POST'});
+  const j=await r.json();
+  if(!r.ok){document.getElementById('progState').textContent=j.error||'更新失败';b.disabled=false;return}
+  document.getElementById('progBox').classList.remove('hidden');
+  startPolling();
+}
+function startPolling(){if(pollTimer)return;pollTimer=setInterval(pollUpdate,1000);pollUpdate()}
+function stopPolling(){if(pollTimer){clearInterval(pollTimer);pollTimer=null}}
+async function pollUpdate(){
+  try{
+    const j=await (await api('/api/update/status')).json();
+    document.getElementById('progBox').classList.remove('hidden');
+    document.getElementById('progState').textContent=j.running?'正在抓取…':(j.error?'抓取出错：'+j.error:'抓取完成 ✓ TVBox '+fmt(j.tvbox_sites)+' 站 / 书源 '+fmt(j.book_sources)+' 个');
+    document.getElementById('progLog').textContent=(j.logs||[]).join('\n');
+    const el=document.getElementById('progLog');el.scrollTop=el.scrollHeight;
+    if(!j.running){document.getElementById('updBtn').disabled=false;stopPolling();refresh();}
+  }catch(e){stopPolling()}
+}
+document.getElementById('pwd').addEventListener('keydown',e=>{if(e.key==='Enter')login()});
+refresh().then(()=>{/* 若已登录会显示主界面 */}).catch(()=>{});
+(async()=>{try{const s=await (await fetch('/api/status')).json();if(s.ok){showMain();refresh()}}catch(e){}})();
+</script>
+</body>
+</html>
