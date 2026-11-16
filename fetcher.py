@@ -107,10 +107,58 @@ STAGE_SPANS = [(0, 10), (10, 20), (20, 34), (34, 41), (41, 53),
 _LAST_PERCENT = [0.0]
 
 
+# ---------------- 内存诊断 (2026-11-16 循环定位) ----------------
+# Render 实例 3 分钟内重启两次、几轮后报 Failed service, 但应用日志里没有
+# OOM 字样——重启原因未确认 (候选: 内存、健康检查超时、平台回收; OOM 杀进程
+# 一般不打印到应用日志, 只在 Render Events 里可见, 用户那边也没看到)。
+# 因此每轮开始、每阶段切换、TVBox 上游循环中每 60 秒、每轮结束都打 RSS,
+# 超过 400MB (免费版上限 512MB) 再打一行警告, 下次看 Render 日志就能判断
+# 是不是内存一路涨到顶被杀的。只用标准库, 失败则跳过不报错。
+MEM_WARN_MB = int(os.environ.get("MEM_WARN_MB", "400") or 400)
+_LAST_STAGE_IDX = [0]
+
+
+def _rss_mb():
+    """当前进程 RSS (MB)。Linux 读 /proc/self/status, 失败回退到
+    resource.ru_maxrss (峰值, 仅作参考), 再失败返回 None。"""
+    try:
+        with open("/proc/self/status", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return round(int(line.split()[1]) / 1024, 1)
+    except Exception:
+        pass
+    try:
+        import resource
+        return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1)
+    except Exception:
+        return None
+
+
+def _log_mem(progress, where):
+    """打一行内存占用; 超过 MEM_WARN_MB 再打一行警告。失败不报错。"""
+    rss = _rss_mb()
+    if rss is None:
+        return
+    _log(progress, f"[内存] {where} RSS {rss} MB")
+    if rss >= MEM_WARN_MB:
+        _log(progress, f"[内存警告] RSS {rss} MB 已超过 {MEM_WARN_MB} MB "
+                       f"(免费版上限 512MB), 有 OOM 被杀风险, 请看 Render Events")
+
+
 def _emit(progress, stage_index, frac, current, done=None, total=None, log=None):
     """上报结构化进度 dict 给 progress 回调, 同时可附带一条字符串日志。
     frac 为本阶段内 0-1 的进度。progress 为 None 时只打印日志
-    (python3 fetcher.py 单独运行就是这种情况, 不报错)。"""
+    (python3 fetcher.py 单独运行就是这种情况, 不报错)。
+    阶段切换时打一行内存占用 (2026-11-16 循环定位用)。"""
+    if stage_index != _LAST_STAGE_IDX[0]:
+        prev = _LAST_STAGE_IDX[0]
+        _LAST_STAGE_IDX[0] = stage_index
+        if prev:
+            _log_mem(progress, f"阶段 {prev}（{STAGE_NAMES[prev - 1]}）结束 / "
+                               f"阶段 {stage_index}（{STAGE_NAMES[stage_index - 1]}）开始")
+        else:
+            _log_mem(progress, f"进入阶段 {stage_index}（{STAGE_NAMES[stage_index - 1]}）")
     lo, hi = STAGE_SPANS[stage_index - 1]
     pct = lo + max(0.0, min(1.0, frac)) * (hi - lo)
     pct = max(pct, _LAST_PERCENT[0])  # 单调递增, 不回跳
@@ -165,19 +213,212 @@ def github_channels(owner, repo, branch, path):
     ]
 
 
+def _host_of(url):
+    """URL 的 host (小写, 不带端口), 供死域名缓存与失败分类用。"""
+    try:
+        return (urlparse(url).hostname or "").lower()
+    except Exception:
+        return ""
+
+
+# ---------------- 失败分类 / 降噪 / 死域名缓存 (2026-11-16) ----------------
+# 背景: 一轮抓取里同一个死域名 (pandown.pro 12 秒超时、gitee 423、DNS 失败、
+# SSL 证书过期、ghproxy 不可达、404) 会在几十个 seed 里反复出现, 每条都打
+# 日志还各烧 12 秒超时。处理: (a) 同一 (host, 失败原因) 一轮内只记一次详情,
+# 其余计数汇总; (b) 同一 host 网络层连续失败达阈值 (默认 3 次) 后 24 小时内
+# 直接跳过 (持久化在 DATA_DIR/dead_hosts.json, 重启后仍有效); (c) 每轮结束
+# 打一行失败汇总。注意: HTTP 状态码 (404/423 等) 说明 host 还活着, 不计入
+# 死域名; 只有网络层失败 (超时/DNS/被拒/SSL) 才计数; “网络不可达”多半是
+# 本机出口问题, 也不计入——否则出口一抖就把所有 host 拉黑。
+# 缓存只影响“跳过重试”, 不影响已抓到的数据; 24 小时后自动放行再试。
+DEAD_HOST_FAILS = int(os.environ.get("DEAD_HOST_FAILS", "3") or 3)
+DEAD_HOST_SKIP_HOURS = int(os.environ.get("DEAD_HOST_SKIP_HOURS", "24") or 24)
+_DEAD_COUNT_KINDS = {"连接超时", "DNS解析失败", "连接被拒/重置", "SSL证书"}
+_DEAD_HOSTS = {}  # host -> {"fails": int, "last_fail": iso, "dead_until": iso|None}
+_DEAD_HOSTS_DIR = None
+_DEAD_HOSTS_LAST_SAVE = [0.0]
+_FAIL = {"by_kind": {}, "detail_seen": set(), "skipped_dead": {}, "total": 0}
+
+
+def _fail_reset():
+    """新一轮抓取开始时清空失败统计 (fetch_all 里调)。"""
+    _FAIL["by_kind"].clear()
+    _FAIL["detail_seen"].clear()
+    _FAIL["skipped_dead"].clear()
+    _FAIL["total"] = 0
+
+
+def _fail_count(kind):
+    _FAIL["by_kind"][kind] = _FAIL["by_kind"].get(kind, 0) + 1
+    _FAIL["total"] += 1
+
+
+def _fail_summary_text():
+    parts = [f"{k} {v} 次" for k, v in
+             sorted(_FAIL["by_kind"].items(), key=lambda kv: -kv[1])]
+    skipped = sum(_FAIL["skipped_dead"].values())
+    s = f"[失败汇总] 本轮共 {_FAIL['total']} 次失败" + \
+        ("：" + " / ".join(parts) if parts else " (0 次)")
+    if skipped:
+        s += f"；死域名跳过 {skipped} 次（{len(_FAIL['skipped_dead'])} 个 host）"
+    return s
+
+
+def _classify_fetch_error(err_text, status=None):
+    """把一次请求失败归类 (供失败汇总计数)。err_text 为异常字符串,
+    status 为 HTTP 状态码 (有状态码时直接按状态码归类)。"""
+    if status is not None:
+        return f"HTTP {status}"
+    t = err_text or ""
+    if ("ConnectTimeout" in t or "ReadTimeout" in t or "Timeout" in t
+            or "timed out" in t):
+        return "连接超时"
+    if ("NameResolutionError" in t or "Failed to resolve" in t
+            or "Name or service not known" in t
+            or "No address associated with hostname" in t):
+        return "DNS解析失败"
+    if ("CERTIFICATE_VERIFY_FAILED" in t or "SSLError" in t
+            or "certificate has expired" in t):
+        return "SSL证书"
+    if "Network is unreachable" in t:
+        return "网络不可达"
+    if ("Connection refused" in t or "Connection reset" in t
+            or "Connection aborted" in t or "ConnectionResetError" in t):
+        return "连接被拒/重置"
+    return "其它网络错误"
+
+
+def _dead_hosts_init(data_dir):
+    """读 DATA_DIR/dead_hosts.json 到内存 (fetch_all 开始时调一次)。
+    文件不存在即空缓存, 不报错。"""
+    global _DEAD_HOSTS_DIR
+    _DEAD_HOSTS_DIR = data_dir
+    _DEAD_HOSTS.clear()
+    try:
+        with open(os.path.join(data_dir, "dead_hosts.json"), encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            for host, rec in (data.get("hosts") or {}).items():
+                if isinstance(rec, dict) and isinstance(rec.get("fails"), int):
+                    _DEAD_HOSTS[str(host).lower()] = rec
+    except Exception:
+        pass
+
+
+def _dead_hosts_save(force=False):
+    """死域名缓存落盘 (节流: 最多每 30 秒写一次, 除非 force)。
+    只在 fetch_all 初始化后才写; 写失败不报错。"""
+    if _DEAD_HOSTS_DIR is None:
+        return
+    now = time.monotonic()
+    if not force and now - _DEAD_HOSTS_LAST_SAVE[0] < 30:
+        return
+    _DEAD_HOSTS_LAST_SAVE[0] = now
+    try:
+        os.makedirs(_DEAD_HOSTS_DIR, exist_ok=True)
+        _atomic_write_json(os.path.join(_DEAD_HOSTS_DIR, "dead_hosts.json"),
+                           {"hosts": _DEAD_HOSTS,
+                            "updated_at": now_iso(),
+                            "fail_threshold": DEAD_HOST_FAILS,
+                            "skip_hours": DEAD_HOST_SKIP_HOURS})
+    except Exception:
+        pass
+
+
+def _dead_host_is_dead(host):
+    """host 连续失败达阈值且未过跳过期 -> True (本轮不再试)。
+    过期则清掉记录放行再试; 记录损坏时按已死处理并补一个 24 小时期限。"""
+    if not host:
+        return False
+    rec = _DEAD_HOSTS.get(host)
+    if not rec:
+        return False
+    if int(rec.get("fails", 0)) < DEAD_HOST_FAILS:
+        return False
+    until = rec.get("dead_until")
+    if until:
+        try:
+            if datetime.fromisoformat(until.replace("Z", "+00:00")) > datetime.now(timezone.utc):
+                return True
+        except Exception:
+            return True
+        _DEAD_HOSTS.pop(host, None)  # 已过期: 放行再试
+        _dead_hosts_save()
+        return False
+    rec["dead_until"] = (datetime.now(timezone.utc)
+                         + timedelta(hours=DEAD_HOST_SKIP_HOURS)).isoformat().replace("+00:00", "Z")
+    _dead_hosts_save(force=True)
+    return True
+
+
+def _dead_host_fail(host):
+    """记一次 host 网络层失败; 达阈值时设 24 小时跳过期并立即落盘。"""
+    if not host:
+        return
+    rec = _DEAD_HOSTS.setdefault(host, {"fails": 0, "last_fail": None, "dead_until": None})
+    rec["fails"] = int(rec.get("fails", 0)) + 1
+    rec["last_fail"] = now_iso()
+    if rec["fails"] >= DEAD_HOST_FAILS and not rec.get("dead_until"):
+        rec["dead_until"] = (datetime.now(timezone.utc)
+                             + timedelta(hours=DEAD_HOST_SKIP_HOURS)).isoformat().replace("+00:00", "Z")
+        _dead_hosts_save(force=True)
+    else:
+        _dead_hosts_save()
+
+
+def _dead_host_ok(host):
+    """host 一次成功即清掉失败记录 (死域名复活)。"""
+    if host and host in _DEAD_HOSTS:
+        _DEAD_HOSTS.pop(host, None)
+        _dead_hosts_save()
+
+
 def fetch_text(urls, progress=None, label=""):
-    """按顺序尝试多个 URL, 返回 (text, used_url), 全部失败返回 (None, None)。"""
+    """按顺序尝试多个 URL, 返回 (text, used_url, content_type),
+    全部失败返回 (None, None, None)。
+    2026-11-16 改: 返回值多了 content_type (供调用方判断“响应根本不是 JSON”);
+    之前返回 (text, used_url) 二元组, 调用方已全部改成三元组。
+    死域名缓存: 同一 host 网络层连续失败达阈值 (默认 3 次) 后 24 小时内直接
+    跳过, 不再烧超时时间; 同一 (host, 失败原因) 一轮内只记一次详情日志,
+    其余只计数 (见 _fail_summary_text)。"""
     last_err = ""
+    last_kind = None
+    content_type = None
     for url in urls:
+        host = _host_of(url)
+        if host and _dead_host_is_dead(host):
+            _FAIL["skipped_dead"][host] = _FAIL["skipped_dead"].get(host, 0) + 1
+            dkey = ("dead-skip", host)
+            if dkey not in _FAIL["detail_seen"]:
+                _FAIL["detail_seen"].add(dkey)
+                _log(progress, f"  跳过死域名 {host}（已连续失败 "
+                               f"{_DEAD_HOSTS.get(host, {}).get('fails', DEAD_HOST_FAILS)} 次，"
+                               f"{DEAD_HOST_SKIP_HOURS} 小时内不再试）")
+            continue
         try:
             r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
             if r.status_code == 200 and r.text.strip():
-                return r.text, url
+                content_type = r.headers.get("Content-Type", "")
+                if host:
+                    _dead_host_ok(host)
+                return r.text, url, content_type
+            # 有 HTTP 响应 (哪怕 404/423) 说明 host 还活着: 只分类计数, 不计死域名。
             last_err = f"HTTP {r.status_code}"
+            last_kind = _classify_fetch_error("", status=r.status_code)
         except Exception as e:  # noqa: BLE001
             last_err = f"{type(e).__name__}: {e}"
-        _log(progress, f"  尝试失败 {url} -> {last_err}")
-    return None, None
+            last_kind = _classify_fetch_error(str(e))
+            # 只有网络层失败才计死域名; “网络不可达”是本机出口问题, 不计入。
+            if host and last_kind in _DEAD_COUNT_KINDS:
+                _dead_host_fail(host)
+        # 降噪: 同一 (host, kind) 一轮内只记一次详情, 其余只计数。
+        if last_kind:
+            _fail_count(last_kind)
+            dkey = (host, last_kind)
+            if dkey not in _FAIL["detail_seen"]:
+                _FAIL["detail_seen"].add(dkey)
+                _log(progress, f"  尝试失败 {url} -> {last_err}")
+    return None, None, None
 
 
 def strip_leading_comment_lines(text):
@@ -388,11 +629,11 @@ def _probe_tvbox_candidate(owner, repo, branch, paths, progress=None):
         raw = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{quote(path, safe='/')}"
         if not _head_ok(raw):
             continue
-        text, used = fetch_text(_discovery_channels(owner, repo, branch, path), progress=None)
+        text, used, _ct = fetch_text(_discovery_channels(owner, repo, branch, path), progress=None)
         if text is None:
             continue
         try:
-            obj = json.loads(text)
+            obj = json.loads(text, strict=False)
         except Exception:
             continue
         if not isinstance(obj, dict):
@@ -412,11 +653,11 @@ def _probe_book_candidate(owner, repo, branch, paths, progress=None):
         raw = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{quote(path, safe='/')}"
         if not _head_ok(raw):
             continue
-        text, used = fetch_text(_discovery_channels(owner, repo, branch, path), progress=None)
+        text, used, _ct = fetch_text(_discovery_channels(owner, repo, branch, path), progress=None)
         if text is None:
             continue
         try:
-            data = json.loads(text)
+            data = json.loads(text, strict=False)
         except Exception:
             continue
         if isinstance(data, dict):
@@ -676,7 +917,7 @@ def _yck_aggregate_ids(progress=None):
                 known_ids.add(int(m.group(1)))
     ids = set()
     for base in YCK_MIRRORS:
-        text, _used = fetch_text([f"{base}/yuedu/shuyuans/index.html"], progress=None)
+        text, _used, _ct = fetch_text([f"{base}/yuedu/shuyuans/index.html"], progress=None)
         if text:
             for m in re.findall(r"shuyuans/content/id/(\d+)\.html", text):
                 ids.add(int(m))
@@ -1223,22 +1464,45 @@ def _parse_tvbox_obj(obj, base_dir, progress=None):
     return sites, parses, lives, spider, doh, rules
 
 
+def _json_head_ok(text):
+    """正文首个非空白字符是不是 {/[ (JSON 对象/数组开头)。
+    先去 BOM/行首注释/尾逗号再判断, 与 _fetch_one_tvbox_json 的解析前处理一致。"""
+    if not isinstance(text, str):
+        return False
+    head = strip_json_noise(strip_leading_comment_lines(text)).lstrip()
+    return bool(head) and head[0] in "{["
+
+
 def _fetch_one_tvbox_json(urls, progress=None, label=""):
-    text, used = fetch_text(urls, progress=progress, label=label)
+    text, used, content_type = fetch_text(urls, progress=progress, label=label)
     if text is None:
         return None, None
     # 2026-11-13 并入他方 stripJsonNoise: 先去 BOM/注释/尾逗号再解析
     cleaned = strip_json_noise(strip_leading_comment_lines(text))
+    # 2026-11-16: 响应根本不是 JSON (agit.ai 等一堆
+    # "Expecting value: line 1 column 1", 多半是 HTML 错误页/删库/需登录):
+    # 先看 Content-Type 与正文首个非空白字符, 不是 {/[ 开头就直接跳过,
+    # 日志写清原因, 不再走解析报错。
+    head = cleaned.lstrip()
+    if not head or head[0] not in "{[":
+        _fail_count("非JSON")
+        preview = head[:80].replace("\n", " ") if head else ""
+        _log(progress, f"  非 JSON（Content-Type: {content_type or '未知'}，"
+                       f"可能已删库/需登录）{used} 首内容: {preview!r}")
+        return None, None
     try:
-        obj = json.loads(cleaned)
+        # strict=False: 允许字符串内的非法控制字符 (如 dm.txt line 13、
+        # cccimg down.php line 780 的控制字符, 之前整份解析失败)。
+        obj = json.loads(cleaned, strict=False)
     except Exception:  # noqa: BLE001
         # 有些文件 (如 jinenge) 在第一个 JSON 对象后还附了另一段配置/垃圾,
         # json.loads 会报 Extra data; 用 raw_decode 只取第一个对象
         try:
-            dec = json.JSONDecoder()
+            dec = json.JSONDecoder(strict=False)
             obj, _end = dec.raw_decode(cleaned.lstrip())
             _log(progress, f"  注意 {used}: 文件含尾部多余内容, 只取第一个 JSON 对象")
         except Exception as e2:  # noqa: BLE001
+            _fail_count("JSON解析失败")
             _log(progress, f"  JSON 解析失败 {used}: {e2}")
             return None, None
     return obj, used
@@ -1313,6 +1577,16 @@ def _speed_test_one(site):
                 "kbps": 0, "channel": "direct", "domestic_cdn": domestic_bonus(host),
                 "vod_ok": False, "error": f"{type(e).__name__}: {e}",
                 "checked_at": now_iso()}
+
+
+def _speed_fail_record(key, e):
+    """测速子任务抛异常时的兜底记录: 该站记不通过, 不杀整轮。
+    (2026-11-16 循环根因修复: 旧版 fut.result() 会把子任务异常抛回主线程,
+    杀死整轮 TVBox 抓取, 进而整轮 fetch_all 没写 status.json。)"""
+    return {"key": key, "api": "", "api_host": "", "ok": False,
+            "ttfb_ms": None, "total_ms": None, "kbps": 0,
+            "channel": "direct", "domestic_cdn": False, "vod_ok": False,
+            "error": f"internal_{type(e).__name__}: {e}", "checked_at": now_iso()}
 
 
 def _speed_score(rec):
@@ -1438,7 +1712,10 @@ def _speed_test_pool(sites, by_key, progress, label, stage_no=3):
         done_n = 0
         pass_n = 0
         for fut in as_completed(futs):
-            rec = fut.result()
+            try:
+                rec = fut.result()
+            except Exception as e:  # noqa: BLE001
+                rec = _speed_fail_record(futs[fut]["key"], e)
             round1[rec["key"]] = rec
             done_n += 1
             if rec.get("ok"):
@@ -1460,7 +1737,10 @@ def _speed_test_pool(sites, by_key, progress, label, stage_no=3):
             futs = {ex.submit(_speed_test_one, by_key[k]): k for k in keys}
             done_n = 0
             for fut in as_completed(futs):
-                rec = fut.result()
+                try:
+                    rec = fut.result()
+                except Exception as e:  # noqa: BLE001
+                    rec = _speed_fail_record(futs[fut], e)
                 k = futs[fut]
                 old = cur[k]
                 m = dict(old)
@@ -1673,6 +1953,30 @@ def _harvest_tvbox_obj(obj, base, progress=None, depth=0):
     return sites, parses, lives, spiders, dohs, rules, stats
 
 
+def _source_key(src):
+    """上游去重键: direct_url 按规范化 URL (小写、去尾部 /);
+    GitHub 形按 owner/repo/branch/path。"""
+    if src.get("direct_url"):
+        return ("direct", src["direct_url"].strip().lower().rstrip("/"))
+    return ("gh", str(src.get("owner", "")).lower(), str(src.get("repo", "")).lower(),
+            str(src.get("branch", "")), str(src.get("path", "")))
+
+
+def _dedup_sources(sources, progress=None):
+    """上游列表去重 (2026-11-16: 同一 seed URL 一轮只抓一次)。
+    同一 URL 被抓两次会重复烧时间、重复打失败日志。返回 (去重后列表, 丢掉数)。"""
+    seen, out, dropped = set(), [], 0
+    for src in sources:
+        k = _source_key(src)
+        if k in seen:
+            dropped += 1
+            _log(progress, f"[TVBox] 跳过重复上游 {src.get('name', k)}（与已列入的上游相同）")
+            continue
+        seen.add(k)
+        out.append(src)
+    return out, dropped
+
+
 def fetch_tvbox(data_dir, progress=None, extra_sources=None, discovery=None):
     # extra_sources 为发现阶段找到的新候选上游 (与固定清单走同一套流程);
     # discovery 为 discover_upstreams 的 report, 记进 meta.json
@@ -1685,6 +1989,10 @@ def fetch_tvbox(data_dir, progress=None, extra_sources=None, discovery=None):
     for _du in _seed_direct:
         sources.append({"name": f"seed direct {_du}", "direct_url": _du})
     _seed_cfg_n = len(_seed_gh) + len(_seed_direct)
+    # 2026-11-16 去重: 同一 URL 一轮只抓一次 (日志里同一 seed 连续出现两次)。
+    sources, _dup_n = _dedup_sources(sources, progress)
+    if _dup_n:
+        _log(progress, f"[TVBox] 上游去重: 丢掉 {_dup_n} 个重复上游, 剩 {len(sources)} 个")
     out_dir = os.path.join(data_dir, "tvbox")
     os.makedirs(out_dir, exist_ok=True)
     all_sites, all_parses, all_lives = [], [], []
@@ -1695,6 +2003,7 @@ def fetch_tvbox(data_dir, progress=None, extra_sources=None, discovery=None):
 
     _emit(progress, 2, 0.0, "开始抓取 TVBox 上游", 0, len(sources) + 1,
           log=f"[TVBox] 开始抓取上游 (固定 {len(TVBOX_SOURCES)} 个 + 发现 {len(sources) - len(TVBOX_SOURCES)} 个)")
+    _mem_last = 0.0  # TVBox 上游循环内每 60 秒打一行内存 (2026-11-16 循环定位)
     for _si, src in enumerate(sources):
         if _deadline_hit():
             _log(progress, "[TVBox] 超时预算, 停止继续抓上游, 用已抓到的收尾")
@@ -1702,6 +2011,10 @@ def fetch_tvbox(data_dir, progress=None, extra_sources=None, discovery=None):
         _emit(progress, 2, _si / (len(sources) + 1),
               f"正在抓 {src['name']}（第 {_si + 1}/{len(sources) + 1} 个上游）",
               _si, len(sources) + 1)
+        _now_mono = time.monotonic()
+        if _now_mono - _mem_last >= 60:
+            _mem_last = _now_mono
+            _log_mem(progress, f"TVBox 上游抓取中 ({_si + 1}/{len(sources) + 1} {src['name']})")
         _log(progress, f"[TVBox] 正在抓 {src['name']}")
         if src.get("direct_url"):
             obj, used = _fetch_one_tvbox_json([src["direct_url"]], progress=progress,
@@ -1853,7 +2166,10 @@ def fetch_tvbox(data_dir, progress=None, extra_sources=None, discovery=None):
         done_n = 0
         pass_n = 0
         for fut in as_completed(futs):
-            rec = fut.result()
+            try:
+                rec = fut.result()
+            except Exception as e:  # noqa: BLE001
+                rec = _speed_fail_record(futs[fut]["key"], e)
             round1[rec["key"]] = rec
             done_n += 1
             if rec.get("ok"):
@@ -1890,7 +2206,10 @@ def fetch_tvbox(data_dir, progress=None, extra_sources=None, discovery=None):
             _done2 = 0
             _pass2 = 0
             for fut in as_completed(futs):
-                rec = fut.result()
+                try:
+                    rec = fut.result()
+                except Exception as e:  # noqa: BLE001
+                    rec = _speed_fail_record(futs[fut], e)
                 round2[rec["key"]] = rec
                 _done2 += 1
                 if rec.get("ok"):
@@ -1949,7 +2268,10 @@ def fetch_tvbox(data_dir, progress=None, extra_sources=None, discovery=None):
             _done3r = 0
             _pass3r = 0
             for fut in as_completed(futs):
-                rec = fut.result()
+                try:
+                    rec = fut.result()
+                except Exception as e:  # noqa: BLE001
+                    rec = _speed_fail_record(futs[fut], e)
                 round3[rec["key"]] = rec
                 _done3r += 1
                 if rec.get("ok"):
@@ -2023,7 +2345,11 @@ def fetch_tvbox(data_dir, progress=None, extra_sources=None, discovery=None):
         _done3 = 0
         _pass3 = 0
         for fut in as_completed(futs):
-            ok, rec = fut.result()
+            try:
+                ok, rec = fut.result()
+            except Exception as e:  # noqa: BLE001
+                ok, rec = False, {"key": futs[fut]["key"], "ok": False,
+                                  "error": f"internal_{type(e).__name__}: {e}"}
             type3_validated[rec["key"]] = rec
             _done3 += 1
             if ok:
@@ -2106,7 +2432,13 @@ def fetch_tvbox(data_dir, progress=None, extra_sources=None, discovery=None):
     _testable_picked = [p for p in picked if p.get("rounds", 0) > 0]
     if _testable_picked and not _deadline_hit():
         _log(progress, f"[TVBox] 真实带宽/DoH 补测 {len(_testable_picked)} 站 (10 并发)")
-        _extras = _measure_tvbox_extras(_testable_picked, site_by_key, progress)
+        try:
+            _extras = _measure_tvbox_extras(_testable_picked, site_by_key, progress)
+        except Exception as e:  # noqa: BLE001
+            # 补测入口抛异常只跳过补测 (站仍保留, throughput 留空),
+            # 绝不杀整轮 (2026-11-16 循环根因修复)。
+            _log(progress, f"[TVBox] 带宽/DoH 补测失败, 跳过: {type(e).__name__}: {e}")
+            _extras = {}
         _extras_stats["measured"] = len(_extras)
         _extras_stats["throughput_ok"] = sum(
             1 for v in _extras.values() if v.get("throughput_kbps"))
@@ -2123,7 +2455,11 @@ def fetch_tvbox(data_dir, progress=None, extra_sources=None, discovery=None):
             _bf_pool.sort(key=_speed_score)
             _bf = _bf_pool[:len(_blocked_keys)]
             if _bf:
-                _bf_extras = _measure_tvbox_extras(_bf, site_by_key, progress)
+                try:
+                    _bf_extras = _measure_tvbox_extras(_bf, site_by_key, progress)
+                except Exception as e:  # noqa: BLE001
+                    _log(progress, f"[TVBox] 回填站带宽/DoH 补测失败, 跳过: {type(e).__name__}: {e}")
+                    _bf_extras = {}
                 _extras.update(_bf_extras)
                 _bf = [r for r in _bf
                        if _bf_extras.get(r["key"], {}).get("cn_reachability") != "blocked"]
@@ -2200,7 +2536,11 @@ def fetch_tvbox(data_dir, progress=None, extra_sources=None, discovery=None):
                 futs = {ex.submit(_validate_type3_one, s, spider_cache): s
                         for s in _adult_type3}
                 for fut in as_completed(futs):
-                    ok, rec = fut.result()
+                    try:
+                        ok, rec = fut.result()
+                    except Exception as e:  # noqa: BLE001
+                        ok, rec = False, {"key": futs[fut]["key"], "ok": False,
+                                          "error": f"internal_{type(e).__name__}: {e}"}
                     _adult_t3_validated[rec["key"]] = rec
             adult_type3_records = [r for r in _adult_t3_validated.values() if r["ok"]]
             adult_meta["type3_passed"] = len(adult_type3_records)
@@ -2231,7 +2571,11 @@ def fetch_tvbox(data_dir, progress=None, extra_sources=None, discovery=None):
                        f"(可测速 {len(adult_speed_records)} / type-3 {len(adult_type3_records)})")
         # B 套可测速站同样补真实带宽/DoH (BLOCKED 的受限内容站同样剔除)
         if adult_speed_records and not _deadline_hit():
-            _adult_extras = _measure_tvbox_extras(adult_speed_records, _adult_by_key, progress)
+            try:
+                _adult_extras = _measure_tvbox_extras(adult_speed_records, _adult_by_key, progress)
+            except Exception as e:  # noqa: BLE001
+                _log(progress, f"[TVBox] B 套带宽/DoH 补测失败, 跳过: {type(e).__name__}: {e}")
+                _adult_extras = {}
             _adult_blocked = {k for k, v in _adult_extras.items()
                               if v.get("cn_reachability") == "blocked"}
             if _adult_blocked:
@@ -2464,6 +2808,7 @@ def fetch_tvbox(data_dir, progress=None, extra_sources=None, discovery=None):
     }
     with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
+    _log(progress, f"[TVBox] 失败汇总（本轮至今）: {_fail_summary_text()}")
     _log(progress, f"[TVBox] 完成: {len(sites)} 站 (热门 {meta['popular_count']} / 偏门 {meta['niche_count']}) / B 套 {len(adult_sites)} 站 / {len(parses)} 解析 / {len(lives)} 直播")
     return meta
 
@@ -2575,7 +2920,9 @@ def _adult_haystack(item):
     parts = [item.get("bookSourceName", ""), item.get("bookSourceGroup", ""),
              item.get("bookSourceComment", ""), item.get("bookSourceUrl", ""),
              _explore_titles(item)]
-    return " ".join(p for p in parts if p).lower()
+    # 字段可能是非字符串 (个别源的 name/url 不是 str): 先转 str 再 join,
+    # 否则 TypeError 会杀死整轮书源过滤 (2026-11-16 循环根因修复)。
+    return " ".join(str(p) for p in parts if p).lower()
 
 
 def _is_adult_or_non_novel(item):
@@ -2689,14 +3036,14 @@ def _strip_leading_template_blocks(tpl, base):
 def _parse_search_request_full(item, book_title, page=1):
     """完整解析, 返回 (parsed_or_None, status, reason)。
     status: 'ok' / 'skipped' (JS 模板/POST 环境拦截, 不应判 0 分) / 'invalid'。"""
-    tpl = (item.get("searchUrl") or "").strip()
+    tpl = (item.get("searchUrl") or "").strip() if isinstance(item.get("searchUrl"), str) else ""
     if not tpl:
         return None, "invalid", "empty_searchUrl"
     # (1) 先剥 @js: 尾巴, 再拆配置, 否则 POST 配置解析失败
     tpl = _strip_js_tail(tpl)
-    if not tpl:
+    if not tpl or not isinstance(tpl, str):
         return None, "invalid", "empty_after_js_strip"
-    base = (item.get("bookSourceUrl") or "").split("#")[0].strip()
+    base = str(item.get("bookSourceUrl") or "").split("#")[0].strip()
     # (2) 处理开头的 {{...}} 块
     if tpl.startswith("{{"):
         cleaned, reason = _strip_leading_template_blocks(tpl, base)
@@ -2710,10 +3057,10 @@ def _parse_search_request_full(item, book_title, page=1):
     if idx != -1:
         url_tpl = tpl[:idx].strip()
         try:
-            config = json.loads(tpl[idx + 1:])
+            config = json.loads(tpl[idx + 1:], strict=False)
         except Exception:
             try:
-                config = json.loads(tpl[idx + 1:].replace("'", '"'))
+                config = json.loads(tpl[idx + 1:].replace("'", '"'), strict=False)
             except Exception:
                 config = {}
     if not url_tpl or url_tpl.startswith("{{"):
@@ -2800,7 +3147,7 @@ def _check_url_reachable(url):
         return False
 
 
-def _search_test_one_detailed(item, book_title, author):
+def _search_test_one_detailed_impl(item, book_title, author):
     """单本书搜索实测, 返回 (result, reason)。
     result: True 通过 / False 失败 (200 但无书名、404、首页返回、超时等) /
             None 跳过 (JS 模板无法复现、或本机出口拦截 POST, 不应判 0 分)。
@@ -2848,6 +3195,17 @@ def _search_test_one_detailed(item, book_title, author):
         if method == "POST" and ("ProxyError" in err or "403" in err):
             return None, f"skipped:env_post_{err[:80]}"
         return False, f"fail:{err[:120]}"
+
+
+def _search_test_one_detailed(item, book_title, author):
+    """单本书搜索实测外壳: 任何未预料的内部异常都记为跳过 (不判 0 分),
+    绝不让一个子任务的异常杀死整轮抓取 (2026-11-16 循环根因修复:
+    旧版 fut.result() 会把 _parse_search_request_full 等处的异常抛回主线程,
+    书源阶段一崩整轮就没写 status.json, 调度器每小时重开一轮)。"""
+    try:
+        return _search_test_one_detailed_impl(item, book_title, author)
+    except Exception as e:  # noqa: BLE001
+        return None, f"skipped:internal_{type(e).__name__}:{str(e)[:100]}"
 
 
 def _search_test_one(item, book_title, author):
@@ -3036,7 +3394,7 @@ def _fetch_aoa_sources(progress=None):
             rr = requests.get(b["url"], headers=AOA_HEADERS, timeout=30)
             if rr.status_code != 200:
                 return {**b, "count": 0, "items": [], "error": f"HTTP {rr.status_code}"}
-            data = json.loads(strip_json_noise(rr.text))
+            data = json.loads(strip_json_noise(rr.text), strict=False)
             if isinstance(data, dict):
                 lists = [v for v in data.values() if isinstance(v, list)]
                 data = lists[0] if lists else []
@@ -3051,7 +3409,13 @@ def _fetch_aoa_sources(progress=None):
     with ThreadPoolExecutor(max_workers=4) as ex:
         futs = {ex.submit(_fetch_bundle, b): b for b in bundles}
         for fut in as_completed(futs):
-            results.append(fut.result())
+            try:
+                results.append(fut.result())
+            except Exception as e:  # noqa: BLE001
+                # 单个包抛异常只记该包 0 条, 不杀整轮 (2026-11-16 循环根因修复)。
+                _b = futs[fut]
+                results.append({**_b, "count": 0, "items": [],
+                                "error": f"internal_{type(e).__name__}: {e}"})
     order = {b["hash"]: i for i, b in enumerate(bundles)}
     results.sort(key=lambda x: order.get(x["hash"], 999))
     _log(progress, "[aoaostar] 合集: " + ", ".join(
@@ -3096,11 +3460,16 @@ def _run_node_validation(domains, deadline_s=1500, concurrency=24, progress=None
            "domains": domains}
     base = os.path.dirname(os.path.abspath(__file__))
     tmpdir = os.path.join(base, ".validate_tmp")
-    os.makedirs(tmpdir, exist_ok=True)
     job_path = os.path.join(tmpdir, "job.json")
     out_path = os.path.join(tmpdir, "out.json")
-    with open(job_path, "w", encoding="utf-8") as f:
-        json.dump(job, f, ensure_ascii=False)
+    try:
+        os.makedirs(tmpdir, exist_ok=True)
+        with open(job_path, "w", encoding="utf-8") as f:
+            json.dump(job, f, ensure_ascii=False)
+    except Exception as e:  # noqa: BLE001
+        # 任务文件写不出去 (只读文件系统/磁盘满) 也只算 Node 不可用, 回退
+        # Python 抽查, 绝不让整轮死在这里 (2026-11-16 循环根因修复)。
+        return None, {}, f"{type(e).__name__}: {e}"
     driver = os.path.join(base, "js", "validate_books.js")
     try:
         import subprocess
@@ -3183,11 +3552,13 @@ def _doh_resolve(hosts, progress=None):
         cn_ans = foreign_ans = poisoned = 0
         for url, is_cn in DOH_RESOLVERS:
             j = _query(url, host)
-            if not j:
+            if not j or not isinstance(j, dict):
                 continue
             answers = j.get("Answer") or []
+            if not isinstance(answers, list):
+                answers = []
             ips = [a.get("data") for a in answers
-                   if a.get("type") == 1 and a.get("data") and a.get("data") != "0.0.0.0"]
+                   if isinstance(a, dict) and a.get("type") == 1 and a.get("data") and a.get("data") != "0.0.0.0"]
             if ips:
                 if is_cn:
                     cn_ip = cn_ip or ips[0]
@@ -3196,7 +3567,7 @@ def _doh_resolve(hosts, progress=None):
                     foreign_ip = foreign_ip or ips[0]
                     foreign_ans += 1
             elif is_cn and (j.get("Status") == 3
-                            or any(a.get("data") == "0.0.0.0" for a in answers)):
+                            or any(isinstance(a, dict) and a.get("data") == "0.0.0.0" for a in answers)):
                 poisoned += 1
         blocked = foreign_ans > 0 and poisoned >= 2 and not cn_ans
         suspected = foreign_ans > 0 and not blocked and poisoned >= 1
@@ -3208,7 +3579,14 @@ def _doh_resolve(hosts, progress=None):
     with ThreadPoolExecutor(max_workers=12) as ex:
         futs = {ex.submit(_resolve_one, h): h for h in todo}
         for fut in as_completed(futs):
-            results[futs[fut]] = fut.result()
+            try:
+                results[futs[fut]] = fut.result()
+            except Exception:  # noqa: BLE001
+                # DoH 单个 host 解析失败只记该 host 未知, 不杀整轮
+                # (2026-11-16 循环根因修复)。
+                results[futs[fut]] = {"cnIp": None, "foreignIp": None, "cnAnswered": 0,
+                                      "foreignAnswered": 0, "cnPoisoned": 0,
+                                      "blocked": False, "suspected": False, "ip": None}
     return results
 
 
@@ -3369,7 +3747,11 @@ def _probe_tvbox_play(api):
     if not items:
         return None
     list_ms = int((time.monotonic() - t0) * 1000)
-    sample = str((items[0] or {}).get("vod_name") or "")
+    # 首条可能是非 dict (个别站 list 里混字符串): 先判类型再取字段,
+    # 否则 AttributeError 会从 _measure_tvbox_extras 的 fut.result() 抛回,
+    # 杀死整轮 TVBox 抓取 (2026-11-16 循环根因修复)。
+    _first = items[0] if isinstance(items[0], dict) else {}
+    sample = str(_first.get("vod_name") or "")
     play_url = None
     play_from = ""
     for it in items[:4]:
@@ -3381,7 +3763,7 @@ def _probe_tvbox_play(api):
             play_from = str(it.get("vod_play_from") or "")
             break
     if not play_url:
-        vid = (items[0] or {}).get("vod_id") or (items[0] or {}).get("id")
+        vid = _first.get("vod_id") or _first.get("id")
         if vid:
             for tmpl in (f"ac=detail&ids={vid}", f"ac=videolist&ids={vid}"):
                 try:
@@ -3519,7 +3901,17 @@ def _measure_tvbox_extras(records, site_by_key, progress=None):
     with ThreadPoolExecutor(max_workers=10) as ex:
         futs = {ex.submit(_one, r): r for r in records}
         for fut in as_completed(futs):
-            k, v = fut.result()
+            try:
+                k, v = fut.result()
+            except Exception:  # noqa: BLE001
+                # 单站带宽/DoH 补测失败只记该站无数据, 不杀整轮
+                # (2026-11-16 循环根因修复)。
+                _r = futs[fut]
+                k = _r["key"]
+                v = {"throughput_kbps": None, "throughput_bytes": None,
+                     "throughput_secs": None, "bitrate_kbps": 0, "resolution": "",
+                     "play": None, "list_ms": None, "total": 0,
+                     "sample": _r.get("sample") or "", "cfg_rank": None}
             extras[k] = v
     hosts = []
     for rec in records:
@@ -3582,7 +3974,13 @@ def fetch_books(data_dir, progress=None, extra_sources=None, discovery=None):
     # ---- 第二书源合集 legado.aoaostar.com (2026-11-13 并入, 与 yck 并列) ----
     # 每个 bundle 一个上游条目 (urls=[合集 JSON 直链]); 女频专包"关耳女频"
     # (hash e3e5d620, 86 条) 重点拉取, 其源打 _aoa_female 标记, 进女频池优先。
-    _aoa_bundles = _fetch_aoa_sources(progress=progress)
+    # 合集入口本身抛异常也只跳过合集, 绝不让整轮死在这里
+    # (2026-11-16 循环根因修复)。
+    try:
+        _aoa_bundles = _fetch_aoa_sources(progress=progress)
+    except Exception as e:  # noqa: BLE001
+        _log(progress, f"[书源] aoaostar 合集抓取失败, 跳过: {type(e).__name__}: {e}")
+        _aoa_bundles = []
     _aoa_by_name = {}
     for _b in _aoa_bundles:
         _entry = {"name": f"aoaostar {_b['name']}", "urls": [_b["url"]],
@@ -3612,14 +4010,21 @@ def fetch_books(data_dir, progress=None, extra_sources=None, discovery=None):
               f"正在抓 {src['name']}（第 {_si + 1}/{len(sources)} 个书源上游）",
               _si, len(sources))
         _log(progress, f"[书源] 正在抓 {src['name']}")
-        text, used = fetch_text(src["urls"], progress=progress, label=src["name"])
+        text, used, _ct = fetch_text(src["urls"], progress=progress, label=src["name"])
         if text is None:
             per_source.append({"name": src["name"], "ok": False, "used_url": None,
                                "kept": 0, "error": "全部通道失败"})
             continue
+        # 2026-11-16: 响应根本不是 JSON (HTML 错误页等) 直接跳过, 不走解析报错。
+        if not _json_head_ok(text):
+            _fail_count("非JSON")
+            per_source.append({"name": src["name"], "ok": False, "used_url": used,
+                               "kept": 0, "error": "响应不是 JSON（可能已删库/需登录）"})
+            continue
         try:
-            data = json.loads(text)
+            data = json.loads(text, strict=False)
         except Exception as e:  # noqa: BLE001
+            _fail_count("JSON解析失败")
             per_source.append({"name": src["name"], "ok": False, "used_url": used,
                                "kept": 0, "error": f"JSON 解析失败: {e}"})
             continue
@@ -3731,7 +4136,10 @@ def fetch_books(data_dir, progress=None, extra_sources=None, discovery=None):
         _ok_r = 0
         for fut in as_completed(futs):
             it = futs[fut]
-            _ok = fut.result()
+            try:
+                _ok = fut.result()
+            except Exception:  # noqa: BLE001
+                _ok = False
             reachable[it["bookSourceUrl"]] = _ok
             _done_r += 1
             if _ok:
@@ -3836,10 +4244,17 @@ def fetch_books(data_dir, progress=None, extra_sources=None, discovery=None):
             if d["tested"] == 0:
                 d["pass"] = None
 
-    _node_domains = _build_node_domains(test_pool)
-    _node_deadline_s = 1500  # Node 四步校验预算 25 分钟 (总预算 60 分钟内)
-    _node_results, _node_stats, _node_error = _run_node_validation(
-        _node_domains, deadline_s=_node_deadline_s, concurrency=24, progress=progress)
+    # (4) 先跑 Node 沙箱四步校验 (有 Node 时); 不可用则 Python 回退
+    # Node 校验入口本身抛异常 (如 _build_node_domains 构造失败) 也只记
+    # error 走 Python 回退, 绝不杀整轮 (2026-11-16 循环根因修复)。
+    try:
+        _node_domains = _build_node_domains(test_pool)
+        _node_deadline_s = 1500  # Node 四步校验预算 25 分钟 (总预算 60 分钟内)
+        _node_results, _node_stats, _node_error = _run_node_validation(
+            _node_domains, deadline_s=_node_deadline_s, concurrency=24, progress=progress)
+    except Exception as e:  # noqa: BLE001
+        _node_results, _node_stats = None, {}
+        _node_error = f"internal_{type(e).__name__}: {e}"
     if _node_results is not None:
         _apply_node_results(_node_results)
         # 代表源替换: 若某域胜出的是备用镜像, 实测池里用胜出的镜像对象替换 primary
@@ -3878,7 +4293,12 @@ def fetch_books(data_dir, progress=None, extra_sources=None, discovery=None):
             _src_done = 0
             for fut in as_completed(fut_map):
                 url, title = fut_map[fut]
-                ok, reason = fut.result()
+                try:
+                    ok, reason = fut.result()
+                except Exception as e:  # noqa: BLE001
+                    # 单本书抽查抛异常只记该本跳过, 不杀整轮
+                    # (2026-11-16 循环根因修复: 旧版这里直接抛回主线程)。
+                    ok, reason = None, f"skipped:internal_{type(e).__name__}:{str(e)[:100]}"
                 d = search_pass.setdefault(url, {"pass": 0, "tested": 0, "skipped": 0,
                                                 "details": {}, "reasons": {},
                                                 "content_bad": 0, "toc_lagging": 0,
@@ -3968,9 +4388,12 @@ def fetch_books(data_dir, progress=None, extra_sources=None, discovery=None):
                      "proofs": TEST_BOOK_TRUTH.get(t, (None, []))[1]})
             _retry_pool = [it for it in test_pool
                            if it["bookSourceUrl"] in _retry_by_url]
-            _retry_domains = _build_node_domains(_retry_pool, books_override=_retry_by_url)
-            _r_results, _r_stats, _r_err = _run_node_validation(
-                _retry_domains, deadline_s=600, concurrency=12, progress=progress)
+            try:
+                _retry_domains = _build_node_domains(_retry_pool, books_override=_retry_by_url)
+                _r_results, _r_stats, _r_err = _run_node_validation(
+                    _retry_domains, deadline_s=600, concurrency=12, progress=progress)
+            except Exception as e:  # noqa: BLE001
+                _r_results, _r_err = None, f"internal_{type(e).__name__}: {e}"
             if _r_results is not None:
                 _done_rt = 0
                 for r in _r_results:
@@ -3998,7 +4421,10 @@ def fetch_books(data_dir, progress=None, extra_sources=None, discovery=None):
                 _done_rt = 0
                 for fut in as_completed(fut_map):
                     url, title = fut_map[fut]
-                    ok, reason = fut.result()
+                    try:
+                        ok, reason = fut.result()
+                    except Exception:  # noqa: BLE001
+                        continue  # 单本复测抛异常只跳过该本, 不杀整轮
                     if ok is True:
                         search_pass[url]["details"][title] = True
                         search_pass[url]["reasons"][title] = reason
@@ -4250,18 +4676,55 @@ def fetch_books(data_dir, progress=None, extra_sources=None, discovery=None):
 # ---------------------------------------------------------------- 总入口
 def fetch_all(data_dir, progress=None, interval_days=7):
     _LAST_PERCENT[0] = 0.0  # 新一轮抓取, percent 从 0 重新开始
+    _LAST_STAGE_IDX[0] = 0  # 阶段切换内存日志从头计
+    _fail_reset()  # 新一轮失败统计从头计
+    _dead_hosts_init(data_dir)  # 读死域名缓存 (上一轮的 24 小时跳过继续有效)
     _ensure_writable_dir(data_dir)
     # 总预算 (默认 60 分钟, FETCH_BUDGET_MINUTES 可改): 从这里起算, 各阶段循环里
     # 检查, 超时即收尾。已抓到的数据靠阶段检查点落盘, 不会丢失。
     _DEADLINE[0] = time.time() + FETCH_BUDGET_MINUTES * 60
     _log(progress, f"[总预算] 本轮抓取总预算 {FETCH_BUDGET_MINUTES} 分钟, 超时即收尾 "
                    "(已抓到的数据已落盘, 不会丢失)")
-    # 第 0 阶段: 自动发现新源 (GitHub 多关键词多页 + 免费搜索引擎 + yck 聚合索引)
-    discovery = discover_upstreams(progress=progress)
-    tv_meta = fetch_tvbox(data_dir, progress=progress,
-                          extra_sources=discovery.get("tvbox"), discovery=discovery)
-    books_meta = fetch_books(data_dir, progress=progress,
-                             extra_sources=discovery.get("books"), discovery=discovery)
+    _log_mem(progress, "本轮开始")
+    # ---- 循环根因修复 (2026-11-16) ----
+    # 旧版 fetch_all 全程没有 try/except: 任一阶段 (发现/TVBox/书源) 抛异常,
+    # 都会跳过 status.json 的写出, 于是 _is_expired() 永远为真, 调度器每小时
+    # 重开一轮, 每轮又在同一处抛掉 —— 日志上就是"一直在抓", 像个死循环,
+    # 而实际上每一轮都在书源阶段 (通常是 _search_test_one_detailed /
+    # _parse_search_request_full 的异常经 fut.result() 抛回主线程) 提前死掉。
+    # 现在每个阶段单独包住: 失败只记 error, 其余阶段照常跑; 收尾一定写
+    # status.json (last_update=now, 附 error/partial), 调度器 7 天内不再重开
+    # 失败的轮次 (失败后想重试请点手动更新); 前端据此显示失败阶段与原因,
+    # 不再只显示"正在抓取"。
+    errors = {}
+    discovery = {}
+    try:
+        # 第 0 阶段: 自动发现新源 (GitHub 多关键词多页 + 免费搜索引擎 + yck 聚合索引)
+        discovery = discover_upstreams(progress=progress) or {}
+    except Exception as e:  # noqa: BLE001
+        errors["discovery"] = f"{type(e).__name__}: {e}"
+        _log(progress, f"[发现] 阶段失败, 跳过新源发现: {errors['discovery']}")
+        discovery = {}
+    _log_mem(progress, "发现阶段结束")
+    tv_meta = {"site_count": 0}
+    try:
+        tv_meta = fetch_tvbox(data_dir, progress=progress,
+                              extra_sources=discovery.get("tvbox"), discovery=discovery) or {"site_count": 0}
+    except Exception as e:  # noqa: BLE001
+        errors["tvbox"] = f"{type(e).__name__}: {e}"
+        _log(progress, f"[TVBox] 阶段失败: {errors['tvbox']}")
+        tv_meta = {"site_count": 0}
+    _log_mem(progress, "TVBox 阶段结束")
+    books_meta = {"book_count": 0}
+    try:
+        books_meta = fetch_books(data_dir, progress=progress,
+                                 extra_sources=discovery.get("books"), discovery=discovery) or {"book_count": 0}
+    except Exception as e:  # noqa: BLE001
+        errors["books"] = f"{type(e).__name__}: {e}"
+        _log(progress, f"[书源] 阶段失败: {errors['books']}")
+        books_meta = {"book_count": 0}
+    _log_mem(progress, "书源阶段结束")
+    # ---- 收尾: 无论哪阶段失败都写 status.json ----
     _emit(progress, 8, 0.8, "写文件：正在写 status.json", None, None)
     status = {
         "last_update": now_iso(),
@@ -4270,12 +4733,31 @@ def fetch_all(data_dir, progress=None, interval_days=7):
         "tvbox_sites": tv_meta.get("site_count", 0),
         "book_sources": books_meta.get("book_count", 0),
     }
-    with open(os.path.join(data_dir, "status.json"), "w", encoding="utf-8") as f:
-        json.dump(status, f, ensure_ascii=False, indent=2)
-    _emit(progress, 8, 1.0,
-          f"抓取完成：TVBox {tv_meta.get('site_count', 0)} 站 / 书源 {books_meta.get('book_count', 0)} 个",
-          None, None,
-          log=f"[完成] TVBox {tv_meta.get('site_count', 0)} 站 / 书源 {books_meta.get('book_count', 0)} 个")
+    if errors:
+        status["error"] = errors
+        status["partial"] = True
+    try:
+        with open(os.path.join(data_dir, "status.json"), "w", encoding="utf-8") as f:
+            json.dump(status, f, ensure_ascii=False, indent=2)
+    except Exception as e:  # noqa: BLE001
+        _log(progress, f"[完成] status.json 写出失败: {type(e).__name__}: {e}")
+    if errors:
+        _fail_txt = "; ".join(f"{k}: {v}" for k, v in errors.items())
+        _emit(progress, 8, 1.0,
+              f"抓取完成（部分失败：{', '.join(errors)}）: TVBox {tv_meta.get('site_count', 0)} 站 / 书源 {books_meta.get('book_count', 0)} 个",
+              None, None,
+              log=f"[完成] 部分失败: {_fail_txt}")
+    else:
+        _emit(progress, 8, 1.0,
+              f"抓取完成：TVBox {tv_meta.get('site_count', 0)} 站 / 书源 {books_meta.get('book_count', 0)} 个",
+              None, None,
+              log=f"[完成] TVBox {tv_meta.get('site_count', 0)} 站 / 书源 {books_meta.get('book_count', 0)} 个")
+    _log(progress, _fail_summary_text())
+    try:
+        _dead_hosts_save(force=True)  # 死域名缓存落盘, 下一轮继续有效
+    except Exception:  # noqa: BLE001
+        pass
+    _log_mem(progress, "本轮结束")
     return tv_meta, books_meta
 
 

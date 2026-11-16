@@ -27,6 +27,22 @@ a.dl{color:#38bdf8;text-decoration:none}
 .err{color:#fca5a5;margin-top:10px;font-size:14px}
 .ok{color:#86efac}
 pre.log{background:#020617;border:1px solid #334155;border-radius:10px;padding:12px;max-height:300px;overflow:auto;font-size:12px;line-height:1.6;white-space:pre-wrap;word-break:break-all}
+.pbar{background:#020617;border:1px solid #334155;border-radius:999px;height:22px;overflow:hidden;margin:10px 0 4px}
+.pfill{height:100%;background:linear-gradient(90deg,#0284c7,#22d3ee);width:0%;transition:width .5s}
+.pfill.done{background:linear-gradient(90deg,#16a34a,#4ade80)}
+.pbig{font-size:30px;font-weight:700;line-height:1.1;margin:6px 0 0}
+.pbig small{font-size:16px;color:#94a3b8;font-weight:400}
+.pmeta{color:#e2e8f0;font-size:14px;margin:6px 0 0}
+.pdetail{color:#94a3b8;font-size:13px;line-height:1.6;margin:4px 0 0}
+.steps{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0 2px}
+.step{font-size:12px;padding:4px 9px;border-radius:999px;border:1px solid #475569;color:#94a3b8;background:#0f172a;white-space:nowrap}
+.step.done{border-color:#16a34a;color:#86efac;background:#052e16}
+.step.active{border-color:#38bdf8;color:#fff;background:#075985;animation:pulse 1.6s ease-in-out infinite}
+.step.stuck{border-color:#f59e0b;color:#fde68a;background:#451a03}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.55}}
+.warn{background:#451a03;border:1px solid #b45309;color:#fde68a;border-radius:10px;padding:10px 12px;font-size:14px;line-height:1.6;margin-top:10px}
+.interrupt{background:#450a0a;border:1px solid #b91c1c;color:#fca5a5;border-radius:10px;padding:10px 12px;font-size:14px;line-height:1.6;margin-top:10px}
+.logtime{color:#64748b}
 .muted{color:#94a3b8;font-size:13px;line-height:1.6}
 .hidden{display:none}
 </style>
@@ -57,9 +73,17 @@ pre.log{background:#020617;border:1px solid #334155;border-radius:10px;padding:1
         <button class="ghost" onclick="downloadAll()">⬇️ 全部下载为 ZIP</button>
         <button class="ghost" onclick="logout()">退出登录</button>
       </div>
-      <p class="muted" id="updHint">手动更新会重新从上游抓取，可能需要 1-3 分钟，期间请勿重复点击。</p>
+      <p class="muted" id="updHint">手动更新会先联网搜索发现新源，再重新从上游抓取，全量抓取通常需要 20-60 分钟，期间请勿重复点击。</p>
       <div id="progBox" class="hidden">
+        <div id="interruptBox" class="interrupt hidden"></div>
         <p id="progState">正在抓取…</p>
+        <p class="pdetail" id="progRun"></p>
+        <p class="pbig"><span id="progPct">0</span><small>%</small></p>
+        <div class="steps" id="progSteps"></div>
+        <div class="pbar"><div class="pfill" id="progFill" style="width:0%"></div></div>
+        <p class="pmeta" id="progMeta"></p>
+        <p class="pdetail" id="progDetail"></p>
+        <div id="stallBox" class="warn hidden"></div>
         <pre class="log" id="progLog"></pre>
       </div>
     </div>
@@ -68,7 +92,7 @@ pre.log{background:#020617;border:1px solid #334155;border-radius:10px;padding:1
       <h2 style="font-size:17px;margin:0">文件列表</h2>
       <table><thead><tr><th>文件</th><th>大小</th><th>更新时间</th><th></th></tr></thead>
       <tbody id="fileRows"><tr><td colspan="4" class="muted">加载中…</td></tr></tbody></table>
-      <p class="muted">tvbox.json 直接导入 TVBox 使用；books.json 直接导入阅读 App（Legado）使用；meta.json 记录每个上游的抓取结果。</p>
+      <p class="muted">tvbox.json 直接导入 TVBox 使用；books.json 直接导入阅读 App（Legado）使用；meta.json 记录每个上游的抓取结果。“全部下载为 ZIP”里还含 tvbox/assets/ 下的依赖包（spider jar 与 type-3 站的 api/ext 文件，供本地/离线备份；json 里的远程 URL 不动，TVBox 仍远程加载）。</p>
     </div>
   </div>
 </div>
@@ -81,16 +105,35 @@ async function api(path,opt){const r=await fetch(path,opt);if(r.status===401){sh
 async function refresh(){
   try{
     const s=await (await api('/api/status')).json();
-    document.getElementById('tvCount').textContent=fmt(s.tvbox_sites);
+    document.getElementById('tvCount').textContent=fmt(s.tvbox_sites)+(s.adult_sites!=null?'（B 套 '+s.adult_sites+' 站）':'');
     document.getElementById('bookCount').textContent=fmt(s.book_sources);
     document.getElementById('lastUpd').textContent=fmtTime(s.last_update);
     document.getElementById('nextUpd').textContent=fmtTime(s.next_update);
+    if(s.vercel){
+      document.getElementById('updHint').textContent=s.fetch_enabled
+        ?'Vercel 模式：手动更新可能因函数时长上限而超时中断，见 README“部署到 Vercel”。'
+        :'Vercel 模式：手动/定时抓取已关闭（一次请求跑不完 4-7 分钟的全量抓取）。更新数据请在本地或 Render 上跑 fetcher.py。';
+      document.getElementById('updBtn').disabled=!s.fetch_enabled;
+      if(s.data_source==='snapshot')document.getElementById('updHint').textContent+='（当前数据为快照，非实时抓取）';
+    }
+    if(s.data_source==='none'){
+      // 2026-11-16 修正: 启动时数据缺失就自动从 0 抓 (见 app.py 调度器),
+      // data/ 是抓取输出不是输入, 不传 data/ 不影响流程, 不用手动点。
+      document.getElementById('updHint').textContent='暂无数据：正在启动自动抓取（约 20–60 分钟），抓完文件会显示在下方列表供下载。抓取只在后台跑，刷新页面不会重开。';
+    }
+    if(s.fetch_error){
+      // 最近一轮有阶段失败: 把失败阶段与原因直接显示出来 (status.json 的 error)。
+      const _fe=Object.entries(s.fetch_error).map(([k,v])=>k+': '+v).join('；');
+      document.getElementById('updHint').textContent='上次抓取部分失败：'+_fe+'。已抓到的数据仍可下载；想重试请点「手动更新抓取」。';
+    }
     const f=await (await api('/api/files')).json();
     const rows=(f.files||[]).map(x=>{
-      const dl=x.name==='tvbox/tvbox.json'?'tvbox.json':x.name==='books/books.json'?'books.json':x.name==='tvbox/meta.json'?'tvbox-meta.json':x.name==='books/meta.json'?'books-meta.json':'status.json';
-      return `<tr><td>${x.name}</td><td>${fmtSize(x.size)}</td><td>${fmtTime(x.mtime)}</td><td><a class="dl" href="/api/download/${dl}">下载</a></td></tr>`;
-    }).join('')||'<tr><td colspan="4">暂无文件，请先手动更新</td></tr>';
+      const dl=x.name.startsWith('tvbox/assets/')?'assets-'+x.name.split('/').pop():x.name==='tvbox/tvbox.json'?'tvbox.json':x.name==='tvbox/tvbox_b.json'?'tvbox-b.json':x.name==='books/books.json'?'books.json':x.name==='tvbox/meta.json'?'tvbox-meta.json':x.name==='books/meta.json'?'books-meta.json':'status.json';
+      const disp=x.name==='tvbox/tvbox_b.json'?x.name+'（B 套）':x.name;
+      return `<tr><td>${disp}</td><td>${fmtSize(x.size)}</td><td>${fmtTime(x.mtime)}</td><td><a class="dl" href="/api/download/${dl}">下载</a></td></tr>`;
+    }).join('')||'<tr><td colspan="4">暂无文件，正在自动抓取，抓完会显示在这里</td></tr>';
     document.getElementById('fileRows').innerHTML=rows;
+    fetchUpdateStatus(); // 登录后立即显示上次抓取状态 (进行中/中断/已完成)
     if(s.updating) startPolling(); else stopPolling();
   }catch(e){/* 已回登录页 */}
 }
@@ -108,20 +151,92 @@ async function triggerUpdate(){
   const b=document.getElementById('updBtn');b.disabled=true;
   const r=await fetch('/api/update',{method:'POST'});
   const j=await r.json();
-  if(!r.ok){document.getElementById('progState').textContent=j.error||'更新失败';b.disabled=false;return}
+  if(!r.ok){document.getElementById('progBox').classList.remove('hidden');document.getElementById('progState').textContent=j.error||'更新失败';b.disabled=false;return}
   document.getElementById('progBox').classList.remove('hidden');
   startPolling();
 }
 function startPolling(){if(pollTimer)return;pollTimer=setInterval(pollUpdate,1000);pollUpdate()}
 function stopPolling(){if(pollTimer){clearInterval(pollTimer);pollTimer=null}}
+const STAGE_NAMES=['发现新源','抓取 TVBox 上游','TVBox 测速第 1 轮','TVBox 测速复测（第 2+3 轮）','TVBox type-3 校验','抓取书源','书源搜书抽查','写文件'];
+function fmtElapsed(s){s=s||0;const h=Math.floor(s/3600),m=Math.floor(s%3600/60),sec=s%60;const mm=String(m).padStart(2,'0'),ss=String(sec).padStart(2,'0');return h>0?h+':'+mm+':'+ss:mm+':'+ss}
+function fmtAgo(iso){if(!iso)return '';const d=Math.max(0,Math.floor((Date.now()-new Date(iso).getTime())/1000));if(d<60)return d+' 秒前';if(d<3600)return Math.floor(d/60)+' 分钟前';return Math.floor(d/3600)+' 小时 '+Math.floor(d%3600/60)+' 分钟前'}
+function fmtClock(iso){try{return new Date(iso).toLocaleTimeString('zh-CN',{hour12:false})}catch(e){return ''}}
+function fmtStart(iso){try{return new Date(iso).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false})}catch(e){return iso||''}}
+let firstRender=true;
+function renderSteps(j){
+  const cur=j.stage_index||0,total=j.stage_total||8;
+  let html='';
+  for(let i=1;i<=total;i++){
+    const name=STAGE_NAMES[i-1]||('阶段 '+i);
+    let cls='',mark='';
+    if(j.done&&!j.error){cls='done';mark='✓ '}
+    else if(i<cur){cls='done';mark='✓ '}
+    else if(i===cur&&(j.running||j.interrupted||j.error)){cls=j.running?'active':'stuck';mark=j.running?'▶ ':'⚠ '}
+    html+='<span class="step '+cls+'">'+mark+i+'. '+name+'</span>';
+  }
+  document.getElementById('progSteps').innerHTML=html;
+}
+function renderUpdate(j){
+  if(!j||!j.started_at){return} // 从未抓取过: 进度区保持隐藏
+  document.getElementById('progBox').classList.remove('hidden');
+  const pct=j.percent!=null?j.percent:0;
+  // 首次渲染不做 0→当前值的扫动动画, 否则每次刷新看起来都像从头跑
+  const fill=document.getElementById('progFill');
+  if(firstRender){fill.style.transition='none';firstRender=false;requestAnimationFrame(()=>{fill.style.transition='';})}
+  fill.style.width=pct+'%';
+  fill.classList.toggle('done',!j.running&&!j.error&&j.done);
+  document.getElementById('progPct').textContent=pct;
+  // 本轮身份常驻显示: 刷新前后对一下 run id / 开始时间即知是不是同一轮
+  document.getElementById('progRun').textContent=
+    '本轮 '+(j.run_id||'—')+' · 开始于 '+fmtStart(j.started_at)+'（本地时间） · 已用 '+fmtElapsed(j.elapsed_seconds);
+  renderSteps(j);
+  const stageStr=j.stage?('第 '+(j.stage_index||'')+'/'+(j.stage_total||8)+' 阶段：'+j.stage):'';
+  const cnt=(j.done_count!=null&&j.total_count!=null)?('（'+j.done_count+'/'+j.total_count+'）'):'';
+  const ago=j.last_activity_at?(' · 上次活动 '+fmtAgo(j.last_activity_at)):'';
+  const ib=document.getElementById('interruptBox');
+  if(j.interrupted){
+    ib.classList.remove('hidden');
+    ib.textContent='⚠️ '+(j.interrupted_reason||'上次抓取被服务重启中断，未完成。')+'请点「手动更新抓取」重新开始。';
+  }else{ib.classList.add('hidden')}
+  const sb=document.getElementById('stallBox');
+  if(j.stalled){
+    sb.classList.remove('hidden');
+    sb.textContent='⚠️ 已 '+fmtElapsed(j.stalled_seconds||0)+' 无进展，可能卡在「'+(j.stage||'未知阶段')+' / '+(j.current||'未知任务')+'」。抓取仍在后台运行，请稍候；若长时间不动，可查看服务日志，或重启服务后手动更新。';
+  }else{sb.classList.add('hidden')}
+  if(j.running){
+    document.getElementById('progState').textContent='正在抓取…';
+    document.getElementById('progMeta').textContent=stageStr+' · 已用 '+fmtElapsed(j.elapsed_seconds)+ago;
+    document.getElementById('progDetail').textContent=(j.current||'')+cnt;
+  }else if(j.error){
+    document.getElementById('progState').textContent='抓取出错'+(stageStr?'（'+stageStr+'）':'')+'：'+j.error;
+    document.getElementById('progMeta').textContent='已用 '+fmtElapsed(j.elapsed_seconds)+'，最后阶段：'+(j.stage||'未知')+ago;
+    document.getElementById('progDetail').textContent=j.current||'';
+  }else{
+    document.getElementById('progState').textContent='抓取完成 ✓ TVBox '+fmt(j.tvbox_sites)+' 站 / 书源 '+fmt(j.book_sources)+' 个（用时 '+fmtElapsed(j.elapsed_seconds)+'）';
+    document.getElementById('progMeta').textContent='已完成 100%'+ago;
+    document.getElementById('progDetail').textContent=j.current||'';
+  }
+  const lines=(j.logs||[]).map(e=>{
+    if(typeof e==='string')return e;
+    if(e&&e.msg)return (e.ts?'['+fmtClock(e.ts)+'] ':'')+e.msg;
+    return '';
+  }).join('\n');
+  const el=document.getElementById('progLog');
+  el.textContent=lines;
+  el.scrollTop=el.scrollHeight;
+  // 按钮状态跟随运行状态: 刷新后按钮不再误显示为可点 (旧代码只在点击时禁用,
+  // 刷新后按钮恢复可点, 点了只会返回 409, 还会把进度区文字盖成报错)
+  document.getElementById('updBtn').disabled=!!j.running;
+  if(!j.running){stopPolling()}
+}
+async function fetchUpdateStatus(){
+  try{const j=await (await api('/api/update/status')).json();renderUpdate(j);return j}
+  catch(e){return null}
+}
 async function pollUpdate(){
   try{
-    const j=await (await api('/api/update/status')).json();
-    document.getElementById('progBox').classList.remove('hidden');
-    document.getElementById('progState').textContent=j.running?'正在抓取…':(j.error?'抓取出错：'+j.error:'抓取完成 ✓ TVBox '+fmt(j.tvbox_sites)+' 站 / 书源 '+fmt(j.book_sources)+' 个');
-    document.getElementById('progLog').textContent=(j.logs||[]).join('\n');
-    const el=document.getElementById('progLog');el.scrollTop=el.scrollHeight;
-    if(!j.running){document.getElementById('updBtn').disabled=false;stopPolling();refresh();}
+    const j=await fetchUpdateStatus();
+    if(j&&!j.running){refresh()}
   }catch(e){stopPolling()}
 }
 document.getElementById('pwd').addEventListener('keydown',e=>{if(e.key==='Enter')login()});

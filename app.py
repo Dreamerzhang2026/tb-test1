@@ -51,9 +51,11 @@ elif IS_VERCEL:
 else:
     DATA_DIR = "data"
 
-# 仓库自带的 data/ 快照 (只读): Vercel 上 data/ 若随代码一起部署
-# (需 git add -f data/, 因 .gitignore 默认忽略 data/), 启动时先用它顶上,
-# 这样冷启动 / /tmp 被清空后首页也不会 500。本地/Render 上它就是 data/ 本身。
+# 仓库自带的 data/ 快照 (只读): 历史遗留的回退路径, 仅当仓库里恰好有
+# data/ 文件时才生效。按 2026-11-16 的规则, data/ 是抓取输出、永远不进
+# 仓库, 所以 Render 上这条路是惰性的 (仓库里没有 data/); 启动时数据缺失
+# 就自动从 0 抓, 不靠快照顶上。本地开发时若仓库 data/ 里有旧数据, 读路径
+# 会回退到它, 直到新一轮抓完覆盖。
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 BUNDLED_DATA_DIR = os.path.join(BASE_DIR, "data")
 
@@ -76,7 +78,9 @@ SNAPSHOT_FILES = ["tvbox/tvbox.json", "tvbox/tvbox_b.json", "tvbox/meta.json",
 def _ensure_data_dir():
     """确保 DATA_DIR 可写, 并用仓库 data/ 快照补齐缺失文件。
     只补缺失的文件, 绝不覆盖已抓到的新数据。/tmp 被清空 (Vercel 冷启动)
-    后靠这一步恢复。任一步失败只打日志, 不让启动崩掉 (读路径会回退到快照)。"""
+    后靠这一步恢复。任一步失败只打日志, 不让启动崩掉 (读路径会回退到快照)。
+    注意: 按 2026-11-16 的规则 data/ 永远不进仓库, Render 上仓库里没有
+    data/, 这一步实际只建目录, 不播种任何东西; 启动自动从 0 抓才是正路。"""
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
         os.makedirs(os.path.join(DATA_DIR, "tvbox"), exist_ok=True)
@@ -125,12 +129,16 @@ def _data_source():
 # 不走 __main__, 所以播种不能只放在 __main__ 里。
 _ensure_data_dir()
 
-# ---------------- 抓取进度 (内存) ----------------
+# ---------------- 抓取进度 (内存 + 磁盘持久化) ----------------
 # 结构化进度字段 (2026-11-13 详细进度): stage/stage_index/stage_total 为
 # 当前阶段 (共 8 个), percent 0-100 单调递增, current 为当前在干什么,
 # done_count/total_count 为当前阶段已完成/总数, elapsed_seconds 为已用秒,
 # last_log_at 为最后一条日志时间。注意 "done" 仍是布尔值 (抓取是否结束),
 # 所以阶段计数用 done_count/total_count, 避免覆盖它。
+# 2026-11-16 持久化 (刷新/重启不再重跑): 状态同时写到
+# DATA_DIR/update_state.json; 启动时读回, 上次 running 的进程若已死,
+# 标记 interrupted, 绝不悄悄重开。日志每条带时间戳 {"ts": ISO, "msg": str}。
+# last_activity_at 为最后一次日志或进度变化的时间, 供前端判断"卡住"。
 _update_lock = threading.Lock()
 _update_state = {
     "running": False, "done": False, "started_at": None, "finished_at": None,
@@ -138,7 +146,19 @@ _update_state = {
     "stage": None, "stage_index": 0, "stage_total": 8, "percent": 0,
     "current": None, "done_count": None, "total_count": None,
     "elapsed_seconds": 0, "last_log_at": None,
+    "interrupted": False, "interrupted_at": None, "interrupted_reason": None,
+    "last_activity_at": None,
+    "run_id": None,  # 本轮抓取唯一标识 (刷新前后对一下即知是不是同一轮)
 }
+_STATE_FILE = "update_state.json"
+_STATE_SAVE_INTERVAL_S = 2.0  # 最多每 2 秒落盘一次
+_last_state_save = [0.0]
+# 卡住判定阈值 (秒): 抓取进行中但超过这么久无日志也无进度变化即视为卡住。
+# 环境变量 STALL_AFTER_SECONDS 可覆盖 (默认 300, 测试时可设小)。
+STALL_AFTER_SECONDS = int(os.environ.get("STALL_AFTER_SECONDS", "300") or 300)
+# 调度器每小时检查一次的间隔 (秒): 环境变量 SCHEDULER_CHECK_SECONDS 可覆盖
+# (默认 3600; 仅供测试时缩短, 正常部署不要改)。
+SCHEDULER_CHECK_SECONDS = int(os.environ.get("SCHEDULER_CHECK_SECONDS", "3600") or 3600)
 
 
 def _elapsed_seconds():
@@ -158,6 +178,102 @@ def _elapsed_seconds():
         except Exception:
             pass
     return max(0, int((datetime.now(timezone.utc) - dt).total_seconds()))
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _state_file_path():
+    return os.path.join(DATA_DIR, _STATE_FILE)
+
+
+def _save_update_state(force=False):
+    """把 _update_state 落盘到 DATA_DIR/update_state.json (原子写)。
+    节流: 最多每 2 秒写一次, 除非 force。写失败 (如只读文件系统) 只打日志,
+    不影响抓取本身。"""
+    now_mono = time.monotonic()
+    if not force and now_mono - _last_state_save[0] < _STATE_SAVE_INTERVAL_S:
+        return
+    _last_state_save[0] = now_mono
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp = _state_file_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_update_state, f, ensure_ascii=False)
+        os.replace(tmp, _state_file_path())
+    except OSError as e:
+        print(f"⚠️  抓取状态落盘失败: {e}", flush=True)
+
+
+def _load_update_state():
+    """启动时读回上次的抓取状态。
+    若上次标记为 running, 说明进程在抓取中途死了 (服务重启/休眠被杀),
+    标记 interrupted 并写明中断时间与进度, 绝不悄悄重开;
+    其它状态 (完成/出错) 原样恢复, 供前端展示。"""
+    try:
+        with open(_state_file_path(), encoding="utf-8") as f:
+            saved = json.load(f)
+    except Exception:
+        return
+    if not isinstance(saved, dict):
+        return
+    # 只接受已知字段, 防止旧文件/脏数据污染
+    for k in list(_update_state.keys()):
+        if k in saved:
+            _update_state[k] = saved[k]
+    # 兼容: 旧版日志是裸字符串, 统一转成带时间戳的对象
+    logs = _update_state.get("logs") or []
+    fixed = []
+    for entry in logs:
+        if isinstance(entry, dict) and "msg" in entry:
+            fixed.append(entry)
+        else:
+            fixed.append({"ts": _update_state.get("last_log_at") or _now_iso(),
+                          "msg": str(entry)})
+    _update_state["logs"] = fixed[-300:]
+    if _update_state.get("running"):
+        started = _update_state.get("started_at") or "未知时间"
+        pct = _update_state.get("percent") or 0
+        stage = _update_state.get("stage") or "未知阶段"
+        _update_state["running"] = False
+        _update_state["done"] = False
+        _update_state["interrupted"] = True
+        _update_state["interrupted_at"] = _now_iso()
+        _update_state["interrupted_reason"] = (
+            f"上次抓取 ({_update_state.get('run_id') or '未知轮次'}) 在 "
+            f"{_update_state['interrupted_at']} 被服务重启中断, "
+            f"未完成 (开始于 {started}, 进度 {pct}%, 阶段: {stage})。"
+            f"数据未丢失, 请点「手动更新抓取」重新开始。")
+        _update_state["finished_at"] = _update_state["interrupted_at"]
+        _update_state["logs"].append(
+            {"ts": _now_iso(), "msg": _update_state["interrupted_reason"]})
+        _update_state["logs"] = _update_state["logs"][-300:]
+        _update_state["last_log_at"] = _now_iso()
+        _update_state["last_activity_at"] = _update_state["last_log_at"]
+        print(f"[state] { _update_state['interrupted_reason']}", flush=True)
+    _save_update_state(force=True)
+
+
+# 启动时 (import 时) 读回上次状态: Vercel 上 api/index.py 只 import app,
+# 不走 __main__, 所以恢复不能只放在 __main__ 里。
+_load_update_state()
+
+# 进程启动标识 (2026-11-16 循环诊断): 每次进程启动生成一个 boot id,
+# 启动日志行带数据状态, Render 日志里一眼能看到重启 (及重启后是否重抓)。
+# 重启原因目前未确认 (应用日志里没有 OOM 字样; 候选: 内存、健康检查超时、
+# 平台回收), 靠这行 + 抓取中的内存日志下次定位。
+BOOT_ID = secrets.token_hex(4)
+
+
+def _boot_log_line():
+    """启动时打一行带 boot id 的日志: 数据状态 + 上次更新时间。
+    在 _read_status/_data_source 定义之后调一次 (python app.py 只跑一次,
+    不重复打印)。"""
+    st = _read_status()
+    print(f"[boot {BOOT_ID}] 服务启动 数据状态: {_data_source()} "
+          f"上次更新: {st.get('last_update') or '无'} "
+          f"下次更新: {st.get('next_update') or '无'}", flush=True)
 
 
 def _status_path():
@@ -191,6 +307,10 @@ def _data_missing():
                 and os.path.exists(_resolve(os.path.join("books", "books.json"))))
 
 
+# 启动日志行 (import 时打一次; 放在 _read_status/_data_source 定义之后)。
+_boot_log_line()
+
+
 def _run_fetch():
     """后台抓取 (只能一个实例在跑), 更新 _update_state。"""
     with _update_lock:
@@ -201,9 +321,16 @@ def _run_fetch():
                              finished_at=None, tvbox_sites=None, book_sources=None,
                              stage="开始抓取", stage_index=0, stage_total=8, percent=0,
                              current="正在启动抓取…", done_count=None, total_count=None,
-                             elapsed_seconds=0, last_log_at=None)
+                             elapsed_seconds=0, last_log_at=None,
+                             interrupted=False, interrupted_at=None,
+                             interrupted_reason=None, last_activity_at=None,
+                             run_id=("run-" + datetime.now(timezone.utc).strftime("%m%d-%H%M%S")
+                                     + "-" + secrets.token_hex(3)))
+        _save_update_state(force=True)
     def _progress(msg):
         # 同时接受字符串日志和结构化进度 dict (fetcher._emit 发 dict, _log 发 str)
+        # fetcher.py 的 _log/_emit 契约不动: 这里只在 app.py 侧给日志加时间戳。
+        now = _now_iso()
         if isinstance(msg, dict) and msg.get("type") == "progress":
             _update_state.update(
                 stage=msg.get("stage"), stage_index=msg.get("stage_index", 0),
@@ -211,19 +338,34 @@ def _run_fetch():
                 percent=msg.get("percent", _update_state["percent"]),
                 current=msg.get("current"),
                 done_count=msg.get("done"), total_count=msg.get("total"))
+            _update_state["last_activity_at"] = now
             _update_state["elapsed_seconds"] = _elapsed_seconds()
+            _save_update_state()
             return
-        _update_state["logs"].append(msg)
+        _update_state["logs"].append({"ts": now, "msg": str(msg)})
         # 日志只留最近 300 行
         if len(_update_state["logs"]) > 300:
             _update_state["logs"] = _update_state["logs"][-300:]
-        _update_state["last_log_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        _update_state["last_log_at"] = now
+        _update_state["last_activity_at"] = now
         _update_state["elapsed_seconds"] = _elapsed_seconds()
+        _save_update_state()
     try:
         tv_meta, books_meta = fetcher.fetch_all(DATA_DIR, progress=_progress,
                                                 interval_days=UPDATE_INTERVAL_DAYS)
         _update_state["tvbox_sites"] = tv_meta.get("site_count")
         _update_state["book_sources"] = books_meta.get("book_count")
+        # 2026-11-16 循环根因修复: fetch_all 现在阶段失败也收尾写 status.json
+        # (带 error/partial), 这里把失败透传到前端, 别只显示"正在抓取"/"完成"。
+        _st = _read_status()
+        if _st.get("error"):
+            _err_txt = "; ".join(f"{k}: {v}" for k, v in _st["error"].items())
+            _update_state["error"] = f"部分阶段失败: {_err_txt}"
+            _update_state["stage"] = "部分失败"
+            _update_state["current"] = (
+                f"抓取完成（部分失败：{', '.join(_st['error'])}）: "
+                f"TVBox {_update_state['tvbox_sites']} 站 / 书源 {_update_state['book_sources']} 个")
+            _progress(f"抓取部分失败: {_err_txt}")
     except Exception as e:  # noqa: BLE001
         _update_state["error"] = str(e)
         _progress(f"抓取出错: {e}")
@@ -239,26 +381,39 @@ def _run_fetch():
             _update_state["current"] = (
                 f"抓取完成：TVBox {_update_state['tvbox_sites']} 站 / "
                 f"书源 {_update_state['book_sources']} 个")
+        _save_update_state(force=True)
     return True
 
 
 def _scheduler_loop():
-    """后台线程: 启动时缺失/过期先抓一次, 之后每间隔检查一次。
+    """后台线程: 启动时数据缺失或已过期就自动抓一次 (从 0 开始抓是正常流程:
+    data/ 是抓取输出, 不是输入; 不传 data/ 不影响流程), 之后每小时检查一次,
+    到期再抓。
+    2026-11-16 循环根因 (已修正): 旧版 fetch_all 没有 try/except, 任一阶段
+    抛异常都会跳过 status.json 的写出, 调度器每小时重开一轮, 每轮又在同一处
+    抛掉 —— 日志上就是"一直在抓", 像个死循环, 实际每轮都在书源阶段提前死掉。
+    现已修: 阶段失败只记 error, 收尾必写 status.json (last_update=now),
+    调度器 7 天内不再重开失败的轮次 (失败后想重试请点手动更新)。
+    上一轮“数据完全缺失时永不自动抓 + 把 data/ 快照传进仓库”的诊断与建议
+    是错的, 2026-11-16 用户纠正后已推翻: data/ 是输出、永远不进仓库;
+    且用户确认服务开了保活、这几天没有重启过, “重启→清空→重抓”的循环
+    解释不成立。真正的循环机制是上面说的“阶段抛异常→没写 status.json→
+    每小时重开”, 详见 README“抓取循环”一节。
     Vercel 上默认不启动 (Serverless 函数返回后后台线程会被冻结,
     定时抓取不可靠; 且全量抓取 4-7 分钟远超函数时长上限)。
     如确需在 Vercel 上抓取, 设 VERCEL_FETCH_ENABLED=1 自担超时风险。"""
     if IS_VERCEL and not VERCEL_FETCH_ENABLED:
-        print("[scheduler] Vercel 环境: 定时抓取已关闭, 只读仓库 data/ 快照。"
-              " 更新数据请在本地/Render 跑 fetcher.py 后把 data/ 提交到仓库再重新部署。",
+        print("[scheduler] Vercel 环境: 定时抓取已关闭 (Serverless 函数返回后后台"
+              "线程会被冻结, 定时抓取不可靠)。更新数据请在 Render/VPS 上运行。",
               flush=True)
         return
     # 等 Flask 启动完成再抓, 避免阻塞首个请求
     time.sleep(3)
-    if _data_missing() or _is_expired():
+    if _data_source() == "none" or _is_expired():
         print("[scheduler] 数据缺失或已过期, 开始首次抓取", flush=True)
         _run_fetch()
     while True:
-        time.sleep(3600)  # 每小时检查一次是否到期
+        time.sleep(SCHEDULER_CHECK_SECONDS)  # 默认每小时检查一次是否到期
         if _is_expired() and not _update_state["running"]:
             print("[scheduler] 到达更新间隔, 开始定时抓取", flush=True)
             _run_fetch()
@@ -355,6 +510,9 @@ def api_status():
         "adult_sites": adult_count,
         "book_sources": book_count if book_count is not None else st.get("book_sources"),
         "updating": _update_state["running"],
+        # 最近一轮若有阶段失败, status.json 带 error/partial, 前端可据此提示
+        "fetch_error": st.get("error"),
+        "partial": st.get("partial", False),
         # Vercel 相关: 前端据此显示提示 / 禁用手动更新按钮
         "vercel": IS_VERCEL,
         "data_source": _data_source(),  # live | snapshot | none
@@ -477,7 +635,22 @@ def api_update_status():
         return jsonify({"ok": False, "error": "未登录"}), 401
     if _update_state["running"]:
         _update_state["elapsed_seconds"] = _elapsed_seconds()
-    return jsonify({"ok": True, **_update_state})
+    # 卡住判定: 进行中但超过 STALL_AFTER_SECONDS 秒无日志也无进度变化
+    stalled = False
+    stalled_seconds = 0
+    if _update_state["running"]:
+        last_act = _update_state.get("last_activity_at") or _update_state.get("started_at")
+        if last_act:
+            try:
+                dt = datetime.fromisoformat(last_act.replace("Z", "+00:00"))
+                stalled_seconds = max(
+                    0, int((datetime.now(timezone.utc) - dt).total_seconds()))
+                stalled = stalled_seconds >= STALL_AFTER_SECONDS
+            except Exception:
+                pass
+    return jsonify({"ok": True, **_update_state,
+                    "stalled": stalled, "stalled_seconds": stalled_seconds,
+                    "stall_after_seconds": STALL_AFTER_SECONDS})
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@
 
 ## 功能
 
-- 定时抓取：环境变量 `UPDATE_INTERVAL_DAYS`（默认 7 天），后台线程每小时检查一次是否到期；启动时数据缺失或过期也会先抓一次；`data/status.json` 记录上次 / 下次更新时间。
+- 定时抓取：环境变量 `UPDATE_INTERVAL_DAYS`（默认 7 天），后台线程每小时检查一次是否到期；**启动时数据缺失或已过期就自动从 0 抓一次**（data/ 是抓取输出，不是输入；不传 data/ 不影响流程，见“抓取循环”一节），之后每小时检查一次，到期再抓。`data/status.json` 记录上次 / 下次更新时间；若某阶段失败，status.json 会带 `error`（失败阶段与原因）与 `partial: true`，调度器 7 天内不再重开失败的轮次（想重试请点手动更新）。
 - TVBox 抓取（`fetcher.py`）：按优先级抓 hebijunge、TVboxorg、qist、Lightconer 单仓聚合、cluntop、gao，再加 4 个偏门补充上游（25175/tvyuan、102244653/dianshi.json、jinenge、niubihu1，见“筛选标准”）；每个上游 jsDelivr → ghproxy → raw 三通道回退，超时 12 秒；剥离行首 `//` 注释；`./jar` 等相对路径解析为绝对 URL；spider 剥掉 `;md5;…` 后缀再解析，jpg/png 伪装的 spider 原样保留；type=3 站不再要求 api 是 http jar，csp_ 类名 / py_ 模块 / drpy JS 都保留，校验方式改为上游 spider jar 多通道 HEAD/GET 200（jsDelivr 对 .jar 返回 403，须改走 raw 才能测）+ ext 若是 URL 则 HEAD/GET 能打开，按 quota 只加约 34 个偏门；内容分级与双套输出（2026-11-13）：TVBox 最终生成两套——A 套 `tvbox/tvbox.json`（严格模式，受限内容一律排除，宁可错杀不可漏进 A 套）与 B 套 `tvbox/tvbox_b.json`（被判为受限内容的站，同样过三轮测速 / type-3 jar-ext 校验，通过才入选；spider/parses/lives 照搬 A 套）。关键词表作用于全部 TVBox 站（去重后、测速前）、type-3 挑选兜底、最终写文件前复核，并过滤 lives 频道名；误杀修复见“筛选标准”第 9 条，明细见 `data/tvbox/meta.json` 的相关字段；多仓索引 `{urls:[]}` 二次解析；按 key 去重后做三轮实测、按速度排序再截断到 120 站（80–150，约 70% 热门 + 30% 偏门；不足 120 也不放宽补录）；保留 parses 全集；直播优先用 Lightconer TVBox-Sources。**2026-11-13 并入**：对方种子清单 `seed-cfgs.txt`（158 个配置 URL，144 个 GitHub + 14 个直链）追加进上游、seed-bases.txt（549 条直连接口）按 200/轮轮换补入候选池；入选站再加一档“真实带宽 + 大陆可达性”实测（顺 m3u8 下一个分片算 kbps、DoH 四解析器判 GFW 污染、ip-api 查归属地打分，见“筛选标准”第 10 条），结果写进 `data/tvbox/meta.json` 的 `extras`（`throughput_kbps` / `cn_reachability` / `region_score`）。
 - 书源抓取：优先抓 yck 聚合 `yck2026.fun/yuedu/shuyuans/json/id/1135.json`，再抓 luanmuc、suwa-ko、XIU2、cjj；逐条校验 HTTP 200 + JSON 解析 + 含 `bookSourceName` / `bookSourceUrl` / `ruleSearch`；只留 `bookSourceType==0` 文字小说；按关键词表过滤受限内容、短剧、有声、漫画等（关键词表见 fetcher.py，单字“黄”不用作过滤词以免误删正常小说）；规则齐全 + 官网可打开 + 5 本书搜索抽查（3/5 以上通过才算搜得全）后，按通过率排序留 150 个（不足 150 也不放宽补录）（100–200，约 70% 热门 + 30% 偏门）；按 `bookSourceUrl` 去重。**2026-11-13 并入**：第二合集 legado.aoaostar.com（7 个 bundle，含“关耳女频”86 条专包）与 yck 并列为上游；抽查改走 Node.js 子进程四步全流程校验（`js/validate_books.js`，搜索→详情→目录→正文，@js: 规则在 vm 沙箱里真跑，不再一律标未测试）；测试书改为男女频混合 5 本（斗破苍穹、凡人修仙传、庆余年、缠珑、知否知否应是绿肥红瘦），女频源用女频 5 本题（缠珑、知否、庶女攻略、甄嬛传、三生三世十里桃花）；最终 150 里女频/言情源目标 ≥30 个，记在 `data/books/meta.json` 的 `female_count`；四步校验拦掉“搜得到但看不成”的源（乱码/占位/VIP 截断/文不对题），记 `content_bad_excluded`。
 
@@ -122,7 +122,7 @@ TVBox 里需要加载 java 包的源（type-3 站的 spider jar / api / ext 文�
 | `PORT` | `8000` | 监听端口（Render 会自动注入 `PORT`） |
 | `DATA_DIR` | `data` | 数据目录。**Vercel 上默认自动改为 `/tmp/tvbox-legado-data`**（部署后文件系统只读，只有 `/tmp` 可写，写项目内 `data/` 会报 `[Errno 30] Read-only file system`）；本地/Render/VPS 保持 `data`。显式设置时优先用你设的值 |
 | `SECRET_KEY` | 随机 | 会话密钥，不设则每次启动随机生成（重启后需重新登录）。**Vercel 上务必设置固定值**，否则每次冷启动换密钥，登录态会失效 |
-| `VERCEL_FETCH_ENABLED` | `0` | 仅 Vercel（已不再支持，仅留作兼容）：是否允许手动/定时抓取。默认 `0`（关闭，只读仓库 `data/` 快照） |
+| `VERCEL_FETCH_ENABLED` | `0` | 仅 Vercel（已不再支持，仅留作兼容）：是否允许手动/定时抓取。默认 `0`（关闭，不抓取） |
 | `DISCOVERY_ENABLED` | `1` | 自动发现新源开关。默认 `1` 开启（每轮抓取前先联网搜索找新上游）；设 `0` 关闭，只用固定上游清单 |
 | `GITHUB_TOKEN` | （空） | 可选。GitHub 个人访问令牌（classic，public_repo 只读即可）：有则 GitHub 搜索限流从 10 次/分钟提到 30 次/分钟，且能用 code search 补一轮；没有也不报错，只是搜得少一点。不要把真实 token 提交到 GitHub |
 | `FETCH_BUDGET_MINUTES` | `60` | 全轮抓取总时间预算（分钟）。发现 + 抓取 + 测速超过预算即收尾，已抓到的数据靠检查点落盘，不会丢失 |
@@ -132,6 +132,11 @@ TVBox 里需要加载 java 包的源（type-3 站的 spider jar / api / ext 文�
 | `NOVEL_FETCH_TOP` | `1200` | yck 按下载量取前 N 个详情（对方默认 1200；我方聚合 id 列表另算） |
 | `NOVEL_VALIDATE_MAX` | `200` | 书源四步校验池上限（对方默认 1600；我方头部池 400、实测池 200，200 已是本机 60 分钟预算内的上限） |
 | `SESSION_HOURS` | `12` | 登录会话有效期（小时，对方默认 12） |
+| `STALL_AFTER_SECONDS` | `300` | 抓取进行中超过这么多秒无日志也无进度变化，前端显示“可能卡在……”提示。默认 300 秒（5 分钟） |
+| `SCHEDULER_CHECK_SECONDS` | `3600` | 调度器每小时检查一次的间隔（秒）。仅供测试时缩短，正常部署不要改 |
+| `MEM_WARN_MB` | `400` | 内存警告阈值（MB）：抓取中 RSS 超过该值打 `[内存警告]` 行。免费版上限 512MB，默认 400 |
+| `DEAD_HOST_FAILS` | `3` | 死域名阈值：同一 host 网络层连续失败这么多次后，24 小时内不再试 |
+| `DEAD_HOST_SKIP_HOURS` | `24` | 死域名跳过时长（小时），到期自动放行再试 |
 
 ## 从零开始：本地运行
 
@@ -174,8 +179,40 @@ ACCESS_PASSWORD=你的密码 UPDATE_INTERVAL_DAYS=7 PORT=8000 python3 app.py
 1. 把代码推到 GitHub（见下）。
 2. Render → New → Web Service → 选你的仓库，Render 会自动识别 `render.yaml`（Docker 环境）。
 3. 在 Render 的 Environment 里设置 `ACCESS_PASSWORD`（必填，改成强密码），`UPDATE_INTERVAL_DAYS` 默认 7。
-4. 部署完成后打开 Render 给你的域名，输入密码登录。首次启动数据缺失会自动抓取一次（全量约 20–60 分钟，含发现新源、三轮复测、5 本书抽查），可点“手动更新”看进度（8 个阶段 + 百分比 + 实时日志）。
-5. 注意：Render 免费版 15 分钟无访问会休眠，休眠时后台抓取会被冻结甚至杀掉，一次 20–60 分钟的全量抓取很可能中途断掉。应对（二选一）：(a) 用免费的 UptimeRobot 每 5 分钟 ping 一次你的 Render 域名保活；(b) 在本地/VPS 上跑 `python3 fetcher.py`，再把 `data/` 提交到 GitHub 重新部署。抓取每完成一个阶段都会增量写盘（`data/*/checkpoint_*.json`），即使中途被杀，已测的数据也不会丢，但下次要从头再跑一轮才能出完整结果。免费版上不要假装 1 小时一定能跑完。
+4. 部署完成后打开 Render 给你的域名，输入密码登录。服务启动后会自动从 0 开始第一次抓取（全量约 20–60 分钟，含发现新源、三轮复测、5 本书抽查），可看进度（8 个阶段 + 百分比 + 实时日志），抓完文件会显示在列表供下载，不用手动点。**data/ 是抓取输出，不要上传进仓库**（见下节“抓取循环”）。
+5. 注意：Render 免费版 15 分钟无访问会休眠，休眠时后台抓取会被冻结甚至杀掉，一次 20–60 分钟的全量抓取很可能中途断掉。应对（二选一）：(a) 用免费的 UptimeRobot 每 5 分钟 ping 一次你的 Render 域名保活；(b) 接受重启后自动从 0 重抓（启动自动抓），或换有持久磁盘的方案。抓取每完成一个阶段都会增量写盘（`data/*/checkpoint_*.json`），即使中途被杀，已测的数据也不会丢，但下次要从头再跑一轮才能出完整结果。免费版上不要假装 1 小时一定能跑完。
+
+## 抓取循环：为什么会一直重跑（2026-11-16，根因已修正）
+
+2026-11-16 日志现象：`[TVBox] 完成: 120 站` 出现多次、数字还不一样（热门 76/偏门 44/B 套 100 与 77/43/B 套 108），是多轮完整抓取跑完又重开；最后 Render 报 `Failed service`。
+
+**上一轮的诊断是错的（2026-11-16 16:17 用户纠正后推翻）：** 上一轮说是“重启→data/ 被清空→启动见完全无数据就自动全量重抓→跑完→又重启”，并据此改成“数据完全缺失时永不自动抓”+“把 7 个 data/ 快照文件 git add -f 进仓库”。用户纠正：**data/ 就是抓取的结果（输出），不是输入**——不传 data/ 根本不应该影响流程，项目启动后就应该从 0 开始抓，抓完显示到文件列表供下载；且服务开了保活，**这几天都没有重启过**（除了用户自己部署的时候），“重启→清空→重抓”的循环解释不成立。所以上一轮的两条改动全部推翻：启动自动抓已恢复（数据缺失或过期就自动抓），快照上传的建议已删除，**data/ 是输出、永远不进仓库**。
+
+**循环真正机制（单进程内、无重启前提，代码已核实）：** `fetch_all`（fetcher.py，旧版全程没有 try/except）正常返回时一定会写 `status.json`（`last_update`=now），写完后 7 天内 `_is_expired()` 为假，每小时检查不会重抓。但任一阶段抛异常，`status.json` 就没写出来，`_is_expired()` 永远为真，调度器每小时重开一轮，每轮又在同一处抛掉——日志上就是“一直在抓”，像个死循环，实际每一轮都在同一个地方提前死掉。最可能的死点是**书源阶段**：日志里 TVBox 阶段每次都跑到了 `[TVBox] 完成` 才停，书源阶段再也没出过完成行；书源阶段里“一个子任务异常杀死整轮”的点集中在 Python 回退的搜书抽查与复测轮——`_search_test_one_detailed` 内部若抛异常（`_parse_search_request_full` 遇到非字符串字段、模板解析失败等），`fut.result()` 会把异常抛回主线程（fetcher.py 4186/4306 行附近），直接杀掉整轮 `fetch_books`，进而整轮 `fetch_all` 没写 status.json。其他同类死点：Node 四步校验的任务文件写出在 try 外、DoH 解析 `_resolve_one` 遇到非 dict 响应、`_probe_tvbox_play` 取首条非 dict 的 `vod_name`、`_fetch_aoa_sources` 入口、带宽/DoH 补测入口、以及 `fetch_tvbox`/`fetch_books`/`discover_upstreams` 本身的任何未捕获异常。
+
+**本轮修复（代码已改，见 fetcher.py/app.py 注释）：**
+
+- 所有“一个子任务异常杀死整轮”的点都包住了：搜书抽查（`_search_test_one_detailed` 外壳，异常只记该源跳过 `skipped:internal_...`）、复测轮、测速三轮、type-3 校验、DoH 解析、带宽/DoH 补测、aoaostar 合集 bundle、URL 可达性检查——子任务失败只记该源/该书跳过并写清原因，绝不让整轮崩掉。另修了几个内部隐患：`_parse_search_request_full` 非字符串字段防护、`_adult_haystack` 非字符串字段转 str、`_probe_tvbox_play` 首条非 dict 防护、`_run_node_validation` 任务文件写出进 try（Node 不在镜像里时走 Python 回退，不崩）。
+- `fetch_all` 分阶段包住：发现 / TVBox / 书源各阶段单独 try/except，失败只记 `error`，其余阶段照常跑；**收尾一定写 status.json**（`last_update`=now，并加 `error`（失败阶段与原因）与 `partial: true`），调度器 7 天内不再重开失败的轮次（失败后想重试请点手动更新）；前端据此显示失败阶段与原因，不再只显示“正在抓取”。
+- 恢复启动自动抓：启动时数据缺失或已过期就自动抓一次（从 0 开始抓是正常流程），之后每小时检查一次，到期再抓。前端“暂无数据请手动更新”的文案已删掉。
+- 保留上一轮中与重启前提无关的修复：控制字符 JSON（`strict=False`）、非 JSON 响应跳过、seed 去重、死域名缓存（`data/dead_hosts.json`，同一 host 网络层连续失败 3 次后 24 小时内跳过，HTTP 404/423 与“网络不可达”不计入）、内存日志、boot id、失败汇总。
+- “Failed service”在无重启前提下的可能解释（未定论）：部署失败、健康检查失败、或某轮抓取把进程拖垮后平台判失败。应用日志里没有 OOM 字样，用户那边 Render Events 里也没看到 OOM/137。下次若再出现，请去 Render Events 里看具体原因（OOM/137/健康检查失败），再结合启动日志的 boot id 与抓取中的内存日志（每轮开始、每阶段切换、TVBox 上游循环每 60 秒、每轮结束都打 `[内存] ... RSS x MB`，超 400MB 打 `[内存警告]`）定性。
+
+重新部署步骤：把工作区改的文件拷进你的仓库再推（这边没有你的 git remote，推不了）：`app.py`、`fetcher.py`、`templates/index.html`、`README.md`、`tests/test_fetch_loop_fixes.py`、`tests/test_progress_persistence.py`、`tests/test_fetch_loop_v2.py`（新增）。Render 检测到推送自动重新部署。**这次不用传 data/，data/ 是输出、永远不进仓库。部署前先在旧版页面点「全部下载为 ZIP」备份一份数据**：免费版磁盘是临时的，重新部署/重启后容器内的数据会丢失，服务启动后会自动从 0 重抓（约 20–60 分钟）。
+
+本地验证：`python3 tests/test_fetch_loop_v2.py`（新，桩测 4 项：搜书校验抛异常整轮不崩、Node 不可用走 Python 回退、某阶段抛异常收尾仍写 status.json 带 error 且调度器一小时后不重开、启动无数据自动抓一次）与 `python3 tests/test_fetch_loop_fixes.py`（旧套件 6 项，场景 ① 已按新规则改：启动无数据自动抓一次）与 `python3 tests/test_progress_persistence.py`（旧套件 29 项断言，场景 5 已改回“启动无数据自动抓”）。真实全量抓取（20–60 分钟）未在本地跑，只验证了流程。
+
+## 为什么刷新页面后抓取“看起来像重新跑了”
+
+先说结论：**按代码，单纯刷新页面不可能触发新一轮抓取。** 只有点「手动更新抓取」（POST `/api/update`）和调度器能启动抓取；刷新只发 GET（`/`、`/api/status`、`/api/files`、`/api/update/status`），不调 POST；抓取进行中再点更新会返回 409「正在抓取中」；调度器的每小时检查只在数据过期时才抓（`status.json` 里 `last_update 2026-11-13`、7 天间隔，到 11-20 才过期）；Docker 是 `python app.py` 单进程，不存在多进程各跑各的。启动时数据缺失或已过期就自动从 0 抓一次（2026-11-16 改，见上节“抓取循环”）。
+
+那为什么看着像重跑了？最可能的解释是：**刷新时抓取本来就在跑**（之前手动点过，或更早一次启动时开始的），而旧前端没有任何“这是哪一轮”的标识——刷新后进度条从 0% 扫到当前百分比（CSS 过渡动画）、日志区从空一下子填满全部历史，看着就像从头开始；再加上第 1 阶段只占 0–10%，前期百分比很久都停留在个位数，隔几分钟刷新还是个位数，更像“又重跑了”。抓取本身没有重启，只是显示重演了一遍。
+
+现在一眼就能分清：进度区常驻显示**本轮编号（如 `run-1116-143022-a1b2c3`）、开始时间（本地时间）、已用时间**；刷新前后对一下编号和开始时间，相同就是同一轮，不同才是新开了一轮。抓取状态还持久化到了 `data/update_state.json`（每 2 秒最多写一次），服务重启后页面显示的是上次的最后状态；若上次是抓取中途被重启杀掉，会明确标为“被服务重启中断”，不会悄悄重开。日志每行带时间戳（`[HH:MM:SS]`，按浏览器本地时区显示），卡住超过 5 分钟无进展会提示“可能卡在〈当前阶段/任务〉”。
+
+重新部署步骤：把本次改动推到 GitHub（`git add app.py templates/index.html README.md tests/test_progress_persistence.py` 后提交推送），Render 检测到推送会自动重新部署（Docker 构建约几分钟）。**部署前先在旧版页面点「全部下载为 ZIP」备份一份数据**：免费版磁盘是临时的，重新部署/重启后容器内的数据会丢失，服务启动后会自动从 0 重抓（约 20–60 分钟）。
+
+本地验证：`python3 tests/test_progress_persistence.py`，用缓慢的假 fetcher（桩）跑 6 个场景——真实数据下每小时检查不触发、已有过期数据启动自动抓一次、抓取中刷新不重跑（run id 与 started_at 不变、百分比不回跳）、静默 5 秒以上报卡住、中途杀服务再重启标 interrupted 且新一轮 boot 自动抓（新 run_id，不是续跑旧轮）、完全无数据启动自动抓一次（2026-11-16 新规则）。真实全量抓取（20–60 分钟）未在本地跑，只验证了流程。
 
 ## 关于 Vercel（不再支持）
 
@@ -259,7 +296,7 @@ git remote add origin https://github.com/<你的用户名>/<仓库名>.git
 git push -u origin main
 ```
 
-注意：`.env`（真实密码）和 `data/` 默认在 `.gitignore` 里不会被提交；部署平台靠首次启动自动抓取生成数据。如需把本次抓到的数据也一并提交，可 `git add -f data/`（不推荐长期这么做，数据会过期）。如需把本次抓到的数据也一并提交，可 `git add -f data/`（不推荐长期这么做，数据会过期）。
+注意：`.env`（真实密码）和 `data/` 默认在 `.gitignore` 里不会被提交；部署平台首次启动会自动从 0 抓取生成数据。**data/ 是抓取输出，不要提交进仓库**（见“抓取循环”一节）。
 
 ## 使用
 
