@@ -1487,6 +1487,10 @@ def _parse_tvbox_obj(obj, base_dir, progress=None):
         ns = dict(s)
         ns["key"] = str(key)
         ns["type"] = stype
+        # 配置所在目录（供相对路径解析用，输出时 _ 开头键会被剥掉，不进 JSON）。
+        # 2026-11-17 jar 本地化需要它：./jar/*.jar、./deps/... 这类相对 jar
+        # 要按配置所在目录解析成绝对 URL 再下载。
+        ns["_base_dir"] = base_dir
         if stype == 3:
             # 修复: type-3 不再要求 api 是 http jar。保留 csp_ 类名 / py_ 模块 /
             # drpy JS / .py/.jar, 校验改为 spider jar + ext 可达性 (见 fetch_tvbox
@@ -1498,7 +1502,6 @@ def _parse_tvbox_obj(obj, base_dir, progress=None):
             ns["api"] = api_val
             ns["_api_kind"] = api_kind
             ns["_spider"] = spider
-            ns["_base_dir"] = base_dir
         else:
             api_abs = resolve_relative(api, base_dir)
             if not api_abs or not api_abs.startswith(("http://", "https://")):
@@ -1818,8 +1821,13 @@ TYPE3_NICHE_QUOTA = {"4K": 5, "动漫": 6, "地方台/直播": 5, "体育": 4,
 # 用户反馈 (2026-11-13): 现在输出里一个需要加载 java 包的源都没有, jar 依赖
 # 从来没被下载保存过。本模块把 spider jar + 入选 type-3 站的 api/ext 文件
 # 下载到 data/tvbox/assets/, 随最终成果一起交付 (打包 ZIP 里含 assets/)。
-# 注意: json 里的 api/spider 远程 URL 保持不动 (TVBox 远程加载才稳),
-# 这些文件只是随包附带、供本地/离线使用和备份, README 里写明, 别声称改本地路径就能用。
+# 2026-11-17 用户纠正 (之前理解错了): assets 不是"随包附带的备份", 它的用途
+# 就是给大陆访问慢的远程 jar 准备本地副本——各站的 jar 字段必须改写成
+# ./assets/<文件>（见 _localize_site_jars），否则 assets 里的文件没人用、
+# 等于白下。api/ext 的远程文件仍只作备份随包附带，不改写（那是另一回事，
+# 且 TVBox 对 api/ext 相对路径的支持未验证，不擅自改）。
+# 注意: tvbox.json 与 assets/ 在同一目录层级（zip 里 tvbox.json 在根、assets/
+# 是子目录），./assets/... 相对路径才能解析；不要改 jar 字段以外的路径形式。
 ASSET_MAX_BYTES = 64 * 1024 * 1024  # 单个依赖文件上限 64MB
 
 
@@ -1827,6 +1835,18 @@ def _sanitize_asset_name(name):
     name = re.sub(r"[^A-Za-z0-9._\-]+", "_", (name or "").strip())
     name = name.strip("._") or "file"
     return name[:80]
+
+
+def _asset_filename(clean_url, prefix):
+    """按下载规则算出的本地文件名: <prefix>_<clean URL sha256 前 8 位>_<净化后的 basename>。
+    无扩展名时补 .bin（如 getFile?id=... 这类 URL）。与 _download_asset 共用
+    同一规则，jar 本地化靠它把 URL 映射回已下载的文件。"""
+    parsed = urlparse(clean_url)
+    base = _sanitize_asset_name(os.path.basename(parsed.path))
+    if "." not in base:
+        base += ".bin"
+    tag = hashlib.sha256(clean_url.encode()).hexdigest()[:8]
+    return f"{prefix}_{tag}_{base}"
 
 
 def _download_asset(url, dest_dir, prefix, progress=None):
@@ -1838,12 +1858,7 @@ def _download_asset(url, dest_dir, prefix, progress=None):
     clean = _strip_md5_suffix(url.strip())
     if not clean.startswith(("http://", "https://")):
         return None
-    parsed = urlparse(clean)
-    base = _sanitize_asset_name(os.path.basename(parsed.path))
-    if "." not in base:
-        base += ".bin"
-    tag = hashlib.sha256(clean.encode()).hexdigest()[:8]
-    fname = f"{prefix}_{tag}_{base}"
+    fname = _asset_filename(clean, prefix)
     dest = os.path.join(dest_dir, fname)
     if os.path.exists(dest):
         try:
@@ -1941,6 +1956,180 @@ def _download_tvbox_assets(spider_url, type3_final, type3_by_key, assets_dir,
                                    "checkpoint_assets.json"),
                        {"jar_files": jar_files, "total_jobs": len(jobs)})
     return jar_files
+
+
+def _parse_jar_md5(value):
+    """从 jar 值解析 (clean_url, 声明的 md5 或 None)。
+    支持 'url;md5;HEX' 与 'url;HEX'（32 位 hex，如 ...#.png;3130dcf...）两种写法；
+    无 ';' 则 md5 为 None。截断规则与 _strip_md5_suffix 一致（从第一个 ';' 截断）。"""
+    if not isinstance(value, str):
+        return value, None
+    clean = _strip_md5_suffix(value)
+    md5 = None
+    v = value.strip()
+    if ";" in v:
+        tail = v.split(";", 1)[1].strip()
+        if tail.lower().startswith("md5;"):
+            tail = tail[4:].strip()
+        if re.fullmatch(r"[0-9a-fA-F]{32}", tail or ""):
+            md5 = tail
+    return clean, md5
+
+
+def _md5_file(path):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _is_jar_bytes(path):
+    """文件头是不是 jar（zip）: PK\\x03\\x04 / PK\\x05\\x06 / PK\\x07\\x08。
+    改成 .png/.jpg 的伪装 jar 内容仍是 jar，照此判断；HTML 报错页、空文件都判否。"""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4)
+        return head[:2] == b"PK" and head[2:4] in (b"\x03\x04", b"\x05\x06", b"\x07\x08")
+    except Exception:
+        return False
+
+
+def _candidate_bases(site):
+    """相对 jar 的解析基准（按优先级）：站点 _base_dir（配置所在目录）；
+    api URL 所在目录；ext URL（字符串时）所在目录。
+    启发式：解析错了也没关系，下载 404 或文件头不是 jar 都会被拦下、不改写。"""
+    bases = []
+
+    def _add(b):
+        if isinstance(b, str) and b.startswith(("http://", "https://")) and b not in bases:
+            bases.append(b)
+
+    _add(site.get("_base_dir"))
+    for u in (site.get("api"), site.get("ext")):
+        if isinstance(u, str) and u.startswith(("http://", "https://")):
+            _add(u.rsplit("/", 1)[0] + "/")
+    return bases
+
+
+def _localize_site_jars(sites, assets_dir, jar_files, progress=None,
+                        download_fn=None):
+    """把各站的 jar 改写成本地 ./assets/<文件>（2026-11-17 用户纠正）。
+    就地改写 sites 的 jar 字段，返回统计 dict（记进 meta.json 的 jar_localize）：
+      rewritten：成功改成本地路径的站数
+      already_local：本来就是 ./assets/ 的站数
+      kept_remote：[{key, jar, reason}] 改写失败、保留原值的站
+      md5_mismatched：[{key, file, declared, actual}] 声明 md5 与下载文件不符、
+        已去掉 ;md5; 后缀（上游 jar 已更新，本地文件仍可用）
+    规则：
+      - 远程 http(s) jar：下载到 assets/（已在 jar_files 清单里的直接复用，
+        不重复下载），改写为 ./assets/<file>；下载失败保留原值。
+      - 相对路径 jar（./jar/*.jar、./deps/...）：按 _candidate_bases 依次解析
+        成绝对 URL 再下载改写；都解析/下载失败的保留原样并记录。
+      - 已是 ./assets/ 的不动。
+      - 下载/复用的文件必须通过 _is_jar_bytes（jar 是 zip，头是 PK），否则不改写；
+        新下载的非 jar 文件直接删掉，不留坏文件。
+      - 声明了 ;md5; 且与下载文件 md5 一致的保留后缀；不一致的去掉后缀。
+    download_fn 供测试注入，默认 _download_asset。"""
+    if download_fn is None:
+        download_fn = _download_asset
+    os.makedirs(assets_dir, exist_ok=True)
+    url_to_file = {j["url"]: j["file"] for j in (jar_files or [])
+                   if j.get("url")}
+    stats = {"rewritten": 0, "already_local": 0, "kept_remote": [],
+             "md5_mismatched": []}
+
+    def _keep(site, jar, reason):
+        stats["kept_remote"].append({"key": site.get("key", ""),
+                                     "jar": jar, "reason": reason})
+
+    def _fetch_jar(clean, site):
+        """取一个绝对 jar URL 对应的本地文件（复用清单里的，或新下载）。
+        返回 (fname, ok, reason)。"""
+        fname = url_to_file.get(clean)
+        if fname is not None:
+            local_path = os.path.join(assets_dir, fname)
+            if os.path.exists(local_path) and _is_jar_bytes(local_path):
+                return fname, True, ""
+            return None, False, "文件不是 jar（无 PK 文件头）"
+        try:
+            rec = download_fn(clean, assets_dir, "jar", progress)
+        except Exception as e:  # noqa: BLE001
+            rec = None
+            _log(progress, f"  [jar 本地化] 下载异常 {clean}: {e}")
+        if not rec:
+            return None, False, "jar 下载失败"
+        fname = rec["file"]
+        local_path = os.path.join(assets_dir, fname)
+        if not os.path.exists(local_path) or not _is_jar_bytes(local_path):
+            try:
+                os.remove(local_path)
+            except Exception:
+                pass
+            return None, False, "下载的文件不是 jar（无 PK 文件头）"
+        url_to_file[clean] = fname
+        jar_files.append({"file": rec["file"], "url": rec["url"],
+                          "source": "jar:%s" % site.get("key", ""),
+                          "size_bytes": rec["size_bytes"],
+                          "sha256": rec["sha256"]})
+        return fname, True, ""
+
+    for site in sites or []:
+        jar = site.get("jar")
+        if not isinstance(jar, str) or not jar.strip():
+            continue
+        jar = jar.strip()
+        if jar.startswith("./assets/"):
+            stats["already_local"] += 1
+            continue
+        clean, declared_md5 = _parse_jar_md5(jar)
+        if clean.startswith(("http://", "https://")):
+            candidates = [clean]
+        elif clean.startswith(("./", "../", "/")) or (
+                "/" in clean and not clean.startswith("/")):
+            candidates = []
+            for base in _candidate_bases(site):
+                resolved = resolve_relative(clean, base)
+                if resolved and resolved.startswith(("http://", "https://")) \
+                        and resolved not in candidates:
+                    candidates.append(resolved)
+            if not candidates:
+                _keep(site, jar, "相对路径 jar，无配置目录可解析")
+                continue
+        else:
+            _keep(site, jar, "jar 值格式未知，未处理")
+            continue
+        fname = None
+        last_reason = "jar 下载失败"
+        for cand in candidates:
+            fname, ok, reason = _fetch_jar(cand, site)
+            if ok:
+                break
+            last_reason = reason
+            fname = None
+        if not fname:
+            _keep(site, jar, last_reason)
+            continue
+        local_path = os.path.join(assets_dir, fname)
+        if declared_md5:
+            try:
+                actual = _md5_file(local_path)
+            except Exception:
+                actual = None
+            if actual and actual.lower() == declared_md5.lower():
+                site["jar"] = "./assets/%s;md5;%s" % (fname, declared_md5)
+            else:
+                site["jar"] = "./assets/%s" % fname
+                stats["md5_mismatched"].append(
+                    {"key": site.get("key", ""), "file": fname,
+                     "declared": declared_md5, "actual": actual})
+        else:
+            site["jar"] = "./assets/%s" % fname
+        stats["rewritten"] += 1
+    _log(progress, f"[jar 本地化] 改写 {stats['rewritten']} 站，"
+                   f"已本地 {stats['already_local']} 站，"
+                   f"保留原值 {len(stats['kept_remote'])} 站")
+    return stats
 
 
 def _sub_config_urls(obj):
@@ -2640,8 +2829,8 @@ def fetch_tvbox(data_dir, progress=None, extra_sources=None, discovery=None):
             adult_meta["extras_blocked"] = len(_adult_blocked)
 
     # ---- 依赖包下载 (2026-11-13): spider jar + 入选 type-3 站的 api/ext ----
-    # 只下最终入选的 type-3 站 (picked 里 rounds==0 的项); json 里的远程 URL 不动,
-    # 这些文件只是随包附带 (本地/离线使用与备份), 见 README"依赖包 (assets/)"
+    # 只下最终入选的 type-3 站 (picked 里 rounds==0 的项)；各站的 jar 字段在写盘前
+    # 由 _localize_site_jars 统一改写成本地 ./assets/（见下文“jar 本地化”）
     _type3_final = [p for p in picked if p.get("rounds", 0) == 0]
     jar_files = _download_tvbox_assets(spider, _type3_final, type3_by_key,
                                        os.path.join(out_dir, "assets"), progress)
@@ -2707,6 +2896,22 @@ def fetch_tvbox(data_dir, progress=None, extra_sources=None, discovery=None):
         _keep_keys = {s["key"] for s in _final_sites}
         speed_records = [r for r in speed_records if r["key"] in _keep_keys]
         sites = _final_sites
+
+    # ---- jar 本地化 (2026-11-17): 各站远程 jar 下载到 assets/，jar 字段改写成
+    # ./assets/<文件>（大陆访问远程 jar 慢）。失败的站保留远程 URL、不中断。
+    _jar_localize = {"rewritten": 0, "already_local": 0, "kept_remote": [],
+                     "md5_mismatched": []}
+    try:
+        _jar_localize = _localize_site_jars(list(sites) + list(adult_sites),
+                                            os.path.join(out_dir, "assets"),
+                                            jar_files, progress)
+        jar_files.sort(key=lambda r: r["file"])
+        _atomic_write_json(os.path.join(out_dir, "checkpoint_assets.json"),
+                           {"jar_files": jar_files,
+                            "total_jobs": len(jar_files)})
+    except Exception as e:  # noqa: BLE001
+        _log(progress, f"[TVBox] jar 本地化失败，保留远程 URL："
+                       f"{type(e).__name__}: {e}")
 
     out = {}
     if spider:
@@ -2822,6 +3027,7 @@ def fetch_tvbox(data_dir, progress=None, extra_sources=None, discovery=None):
                                "github_rate_limited")},
         "discovered_upstreams": _discovered_tvbox_entries,
         "jar_files": jar_files,
+        "jar_localize": _jar_localize,
         "assets_dir": "tvbox/assets",
         "target": f"{MIN_TVBOX_SITES}-{MAX_TVBOX_SITES} (目标 {MAX_TVBOX_SITES}, 约 70% 热门 + 30% 偏门)",
         "popular_count": sum(1 for r in speed_records if r["category"] == "热门"),
