@@ -1837,14 +1837,17 @@ def _sanitize_asset_name(name):
     return name[:80]
 
 
-def _asset_filename(clean_url, prefix):
+def _asset_filename(clean_url, prefix, default_ext=None):
     """按下载规则算出的本地文件名: <prefix>_<clean URL sha256 前 8 位>_<净化后的 basename>。
-    无扩展名时补 .bin（如 getFile?id=... 这类 URL）。与 _download_asset 共用
-    同一规则，jar 本地化靠它把 URL 映射回已下载的文件。"""
+    无扩展名时补 default_ext（未指定时 jar 类补 .jar——内容已验是 jar，.bin 可能让
+    TVBox 认不出它是 jar；其它依赖文件补 .bin）。与 _download_asset 共用同一规则，
+    jar 本地化靠它把 URL 映射回已下载的文件。"""
+    if default_ext is None:
+        default_ext = ".jar" if prefix == "jar" else ".bin"
     parsed = urlparse(clean_url)
     base = _sanitize_asset_name(os.path.basename(parsed.path))
     if "." not in base:
-        base += ".bin"
+        base += default_ext
     tag = hashlib.sha256(clean_url.encode()).hexdigest()[:8]
     return f"{prefix}_{tag}_{base}"
 
@@ -2029,7 +2032,10 @@ def _localize_site_jars(sites, assets_dir, jar_files, progress=None,
       - 已是 ./assets/ 的不动。
       - 下载/复用的文件必须通过 _is_jar_bytes（jar 是 zip，头是 PK），否则不改写；
         新下载的非 jar 文件直接删掉，不留坏文件。
-      - 声明了 ;md5; 且与下载文件 md5 一致的保留后缀；不一致的去掉后缀。
+      - 本地路径不带 ;md5; 后缀（用户给的例子就是 plain 路径；TVBox 对本地文件
+        的 ;md5; 怎么处理未验证，2026-11-17 实测带后缀的版本导入报解析失败）。
+        md5 只在内部校验下载文件，失配的记在 md5_mismatched（说明上游已更新）。
+      - 无扩展名的 jar 下载保存为 .jar（不补 .bin，TVBox 可能认不出 .bin 是 jar）。
     download_fn 供测试注入，默认 _download_asset。"""
     if download_fn is None:
         download_fn = _download_asset
@@ -2045,13 +2051,14 @@ def _localize_site_jars(sites, assets_dir, jar_files, progress=None,
 
     def _fetch_jar(clean, site):
         """取一个绝对 jar URL 对应的本地文件（复用清单里的，或新下载）。
-        返回 (fname, ok, reason)。"""
+        返回 (fname, ok, reason)。清单里的文件已不存在或不是 jar 时当作没下过，
+        重新下载（不直接判失败）。"""
         fname = url_to_file.get(clean)
         if fname is not None:
             local_path = os.path.join(assets_dir, fname)
             if os.path.exists(local_path) and _is_jar_bytes(local_path):
                 return fname, True, ""
-            return None, False, "文件不是 jar（无 PK 文件头）"
+            url_to_file.pop(clean, None)
         try:
             rec = download_fn(clean, assets_dir, "jar", progress)
         except Exception as e:  # noqa: BLE001
@@ -2110,21 +2117,20 @@ def _localize_site_jars(sites, assets_dir, jar_files, progress=None,
         if not fname:
             _keep(site, jar, last_reason)
             continue
+        # 本地路径不带 ;md5; 后缀（用户给的例子就是 plain 路径；TVBox 对本地文件
+        # 的 ;md5; 怎么处理未验证，带上反而可能导致解析失败）。md5 只在内部校验
+        # 下载文件：失配的记下来（说明上游 jar 已更新），不影响改写。
         local_path = os.path.join(assets_dir, fname)
         if declared_md5:
             try:
                 actual = _md5_file(local_path)
             except Exception:
                 actual = None
-            if actual and actual.lower() == declared_md5.lower():
-                site["jar"] = "./assets/%s;md5;%s" % (fname, declared_md5)
-            else:
-                site["jar"] = "./assets/%s" % fname
+            if not actual or actual.lower() != declared_md5.lower():
                 stats["md5_mismatched"].append(
                     {"key": site.get("key", ""), "file": fname,
                      "declared": declared_md5, "actual": actual})
-        else:
-            site["jar"] = "./assets/%s" % fname
+        site["jar"] = "./assets/%s" % fname
         stats["rewritten"] += 1
     _log(progress, f"[jar 本地化] 改写 {stats['rewritten']} 站，"
                    f"已本地 {stats['already_local']} 站，"

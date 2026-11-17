@@ -12,9 +12,10 @@
      无扩展名补 .bin，.png 伪装 jar 保留 .png）
   ③ _download_asset 复用已存在的文件（不断点、不联网）
   ④ _is_jar_bytes: PK 头判定（真 jar / 空文件 / HTML / 不存在）
-  ⑤ _localize_site_jars: 远程 jar 改写（md5 命中保留后缀 / 失配去后缀 / 无 md5）、
+  ⑤ _localize_site_jars: 远程 jar 改写成本地 plain 路径（md5 只内部校验、不带后缀）、
      已本地不动、相对路径按 _base_dir 解析、相对路径无基准保留、下载失败保留、
-     非 jar 内容不改写且删文件、api/ext 原样不动、同一 URL 多站只下一份
+     非 jar 内容不改写且删文件、清单文件不存在时重新下载、api/ext 原样不动、
+     同一 URL 多站只下一份
 """
 import hashlib
 import os
@@ -61,9 +62,10 @@ def test_asset_filename():
     u = "https://raw.githubusercontent.com/yw88075/tvbox/main/yw530.jar"
     tag = hashlib.sha256(u.encode()).hexdigest()[:8]
     assert f(u, "jar") == "jar_%s_yw530.jar" % tag, f(u, "jar")
-    # 无扩展名补 .bin
+    # 无扩展名补 .jar（jar 类下载；其它依赖文件沿用 .bin）
     u2 = "https://cac.opple.com/yc-media/getFile?id=abc#.png"
-    assert f(u2, "jar").endswith("_getFile.bin"), f(u2, "jar")
+    assert f(u2, "jar").endswith("_getFile.jar"), f(u2, "jar")
+    assert f(u2, "type3").endswith("_getFile.bin"), f(u2, "type3")
     # .png 伪装 jar 保留 .png
     u3 = "https://agit.ai/wzs1973/test/raw/branch/master/jar/999.png"
     assert f(u3, "jar").endswith("_999.png"), f(u3, "jar")
@@ -142,6 +144,9 @@ def test_localize(tmp):
          "size_bytes": len(FAKE_JAR), "sha256": _sha256(FAKE_JAR)},
         {"file": f_png, "url": u_png, "source": "type3",
          "size_bytes": len(FAKE_JAR), "sha256": _sha256(FAKE_JAR)},
+        # 清单里的文件已不存在（过期条目）：应重新下载，而不是直接判失败
+        {"file": "jar_deadbeef_gone.jar", "url": "https://example.com/stale.jar",
+         "source": "type3", "size_bytes": 123, "sha256": "0" * 64},
     ]
 
     # 假下载：相对路径解析后 / 下载失败 / 非 jar 内容 三种桩
@@ -161,6 +166,12 @@ def test_localize(tmp):
                 fh.write(HTML)
             return {"file": name, "url": url, "size_bytes": len(HTML),
                     "sha256": _sha256(HTML)}
+        if url == "https://example.com/stale.jar":
+            name = fetcher._asset_filename(url, prefix)
+            with open(os.path.join(dest_dir, name), "wb") as fh:
+                fh.write(FAKE_JAR)
+            return {"file": name, "url": url, "size_bytes": len(FAKE_JAR),
+                    "sha256": _sha256(FAKE_JAR)}
         return None  # 其余一律下载失败
 
     sites = [
@@ -189,25 +200,29 @@ def test_localize(tmp):
         {"key": "S9", "jar": "https://example.com/missing.jar", "api": "csp_S"},
         # 远程 jar，下载到 HTML（非 jar）
         {"key": "S10", "jar": "https://example.com/bad.jar", "api": "csp_R"},
+        # 清单有条目但文件已不存在：重新下载
+        {"key": "S11", "jar": "https://example.com/stale.jar", "api": "csp_Q"},
     ]
     stats = fetcher._localize_site_jars(sites, assets, jar_files,
                                         download_fn=fake_download)
 
-    assert sites[0]["jar"] == "./assets/%s;md5;%s" % (f_match, md5_match), sites[0]
+    assert sites[0]["jar"] == "./assets/%s" % f_match, sites[0]  # md5 命中也不带后缀
     assert sites[1]["jar"] == "./assets/%s" % f_mismatch, sites[1]
     assert sites[2]["jar"] == "./assets/%s" % f_plain, sites[2]
     assert sites[3]["jar"] == "./assets/%s" % f_plain, sites[3]
-    assert sites[4]["jar"] == "./assets/%s;md5;%s" % (f_png, md5_match), sites[4]
+    assert sites[4]["jar"] == "./assets/%s" % f_png, sites[4]  # .png 伪装 jar 也不带后缀
     assert sites[5]["jar"] == "./assets/old.jar", sites[5]
     assert "jar" not in sites[6], sites[6]
     assert sites[7]["jar"].startswith("./assets/jar_") and sites[7]["jar"].endswith("_x.jar"), sites[7]
     assert sites[8]["jar"] == "./jar/y.jar", sites[8]
     assert sites[9]["jar"] == "https://example.com/missing.jar", sites[9]
     assert sites[10]["jar"] == "https://example.com/bad.jar", sites[10]
+    assert sites[11]["jar"] == "./assets/%s" % fetcher._asset_filename(
+        "https://example.com/stale.jar", "jar"), sites[11]
     # api/ext 原样不动
     assert sites[0]["api"] == "csp_AppRJ" and sites[0]["ext"] == {"url": "http://v.rbotv.cn"}
     # 统计
-    assert stats["rewritten"] == 6, stats  # S1 S2 S3 S3b S4 S7
+    assert stats["rewritten"] == 7, stats  # S1 S2 S3 S3b S4 S7 S11
     assert stats["already_local"] == 1, stats
     assert len(stats["kept_remote"]) == 3, stats  # S8 S9 S10
     assert len(stats["md5_mismatched"]) == 1 and stats["md5_mismatched"][0]["key"] == "S2", stats
@@ -216,12 +231,12 @@ def test_localize(tmp):
     # 非 jar 的下载文件已被删掉，不留坏文件
     bad_name = fetcher._asset_filename("https://example.com/bad.jar", "jar")
     assert not os.path.exists(os.path.join(assets, bad_name))
-    # 同一 URL 只下载一次：fake_download 只被调了 3 次（S7/S9/S10 各 1 次）
-    assert len(calls) == 3, calls
+    # 同一 URL 只下载一次：fake_download 只被调了 4 次（S7/S9/S10/S11 各 1 次）
+    assert len(calls) == 4, calls
     # 新下载的 jar 已追加进 jar_files 清单
     assert any(j["url"] == "https://cdn.jsdelivr.net/gh/some/repo@main/jar/x.jar"
                for j in jar_files), jar_files
-    print("⑤ _localize_site_jars 通过（改写 6 / 已本地 1 / 保留 3 / md5 失配 1）")
+    print("⑤ _localize_site_jars 通过（改写 7 / 已本地 1 / 保留 3 / md5 失配 1）")
 
 
 def main():

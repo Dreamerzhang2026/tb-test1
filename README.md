@@ -110,7 +110,8 @@ research/              调研报告 (TVBox / Legado, 含上游清单与格式说
 
 TVBox 里需要加载 java 包的源（type-3 站的 spider jar / api / ext 文件）以前只校验可达性、从不下载保存。2026-11-13 起，抓取时会把最终 spider 的 jar 和入选 type-3 站的 api/ext 依赖文件下载到 `data/tvbox/assets/`（按来源命名、去重，记大小和 SHA256，下载失败记日志跳过、不中断），清单记在 `data/tvbox/meta.json` 的 `jar_files`（文件名、来源、大小、SHA256）。
 
-- **jar 本地化（2026-11-17，用户纠正）**：`assets/` 不是随包附带的备份，它的用途就是给大陆访问慢的远程 jar 准备本地副本。写盘前，各站的 `jar` 字段会改写成本地路径，例如 `https://xxx.com/xxx/kjtw.jar` → `./assets/jar_<hash>_kjtw.jar`；伪装成 `.png`/`.jpg` 的 jar 也一样（文件内容仍是 jar，按原扩展名保存，如 `./assets/jar_<hash>_999.png`）。声明了 `;md5;` 且与下载文件 md5 一致的保留后缀，不一致的去掉后缀（说明上游 jar 已更新）。下载失败、或文件头不是 jar（无 PK 头，如 HTML 报错页）的站保留远程 URL，原因记在 `meta.json` 的 `jar_localize.kept_remote`。相对路径的 jar（`./jar/*.jar`、`./deps/...`）按配置所在目录解析成绝对 URL 再下载。
+- **jar 本地化（2026-11-17，用户纠正）**：`assets/` 不是随包附带的备份，它的用途就是给大陆访问慢的远程 jar 准备本地副本。写盘前，各站的 `jar` 字段会改写成本地路径，例如 `https://xxx.com/xxx/kjtw.jar` → `./assets/jar_<hash>_kjtw.jar`；伪装成 `.png`/`.jpg` 的 jar 也一样（文件内容仍是 jar，按原扩展名保存，如 `./assets/jar_<hash>_999.png`）。**本地路径不带 `;md5;` 后缀**（2026-11-17 实测：带后缀的版本导入 TVBox 报解析失败；md5 只在内部校验下载文件，失配的记在 `meta.json` 的 `jar_localize.md5_mismatched`）。无扩展名的 jar 保存为 `.jar`（不补 `.bin`）。下载失败、或文件头不是 jar（无 PK 头，如 HTML 报错页）的站保留远程 URL，原因记在 `meta.json` 的 `jar_localize.kept_remote`。相对路径的 jar（`./jar/*.jar`、`./deps/...`）按配置所在目录解析成绝对 URL 再下载。
+- **用法（重要）**：改完之后 `tvbox.json` 不能单独用了，必须和 `assets/` 文件夹放在同一目录（解压整个 zip 再导入本地的 `tvbox.json`），否则 TVBox 找不到 jar。所有下载接口都要登录，TVBox 没法直接用 URL 导入（登不上去）；如需免登录直链（`/tvbox/tvbox.json` + `/tvbox/assets/...`），另行确认再加。
 - **交付**：前端“全部下载为 ZIP”会把 `tvbox/` 整个文件夹打进去（含 A 套 `tvbox.json`、B 套 `tvbox_b.json`、`meta.json` 和 `assets/`）；文件列表里也会显示 `assets/` 下的文件，可单独下载。`tvbox.json` 与 `assets/` 在同一目录层级（zip 里 tvbox.json 在根、assets/ 是子目录），`./assets/...` 相对路径才能解析。
 - **注意**：`api` / `ext` 的远程文件仍只作备份随包附带，不改写；顶层 `spider` 字段也不改写。如需同样改成本地路径，另行确认（TVBox 对 api/ext 相对路径的支持未验证）。
 
