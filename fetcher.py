@@ -114,7 +114,17 @@ _LAST_PERCENT = [0.0]
 # 因此每轮开始、每阶段切换、TVBox 上游循环中每 60 秒、每轮结束都打 RSS,
 # 超过 400MB (免费版上限 512MB) 再打一行警告, 下次看 Render 日志就能判断
 # 是不是内存一路涨到顶被杀的。只用标准库, 失败则跳过不报错。
+# 2026-11-17 书源入口重启定位: TVBox 结束 RSS 已 175MB, 书源入口
+# _fetch_aoa_sources 并发全量解析 7 个合集 (3,907 条) 又把 items 全留
+# 在内存 (调用方只用 count, 主循环还会重拉一遍), 4 并发大 JSON 解析
+# 是 OOM 主因 (见 _fetch_bundle 注释)。故加两道防线: (1) 单次响应
+# 20MB 上限 (MAX_FETCH_BYTES, 流式读超限即弃); (2) 书源主循环每次
+# 抓上游前查 RSS, 超过 MEM_LIMIT_MB (默认 420MB) 即收尾写 partial,
+# 宁可少抓也不被平台 OOM 杀掉 (重启会清空无持久盘的 data/ 从头再来)。
 MEM_WARN_MB = int(os.environ.get("MEM_WARN_MB", "400") or 400)
+MEM_LIMIT_MB = int(os.environ.get("MEM_LIMIT_MB", "420") or 420)
+MAX_FETCH_BYTES = int(os.environ.get("MAX_FETCH_BYTES", str(20 * 1024 * 1024))
+                      or 20 * 1024 * 1024)
 _LAST_STAGE_IDX = [0]
 
 
@@ -396,15 +406,40 @@ def fetch_text(urls, progress=None, label=""):
                                f"{DEAD_HOST_SKIP_HOURS} 小时内不再试）")
             continue
         try:
-            r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
-            if r.status_code == 200 and r.text.strip():
-                content_type = r.headers.get("Content-Type", "")
-                if host:
-                    _dead_host_ok(host)
-                return r.text, url, content_type
-            # 有 HTTP 响应 (哪怕 404/423) 说明 host 还活着: 只分类计数, 不计死域名。
-            last_err = f"HTTP {r.status_code}"
-            last_kind = _classify_fetch_error("", status=r.status_code)
+            # 2026-11-17: 流式读 + MAX_FETCH_BYTES 上限, 防单个超大响应
+            # (如几百 MB 的错误页/死循环分块流) 一次撑爆内存导致 OOM 被杀。
+            # 超限按失败处理 (记"响应过大"), 不抛异常、不计死域名。
+            r = requests.get(url, headers=HEADERS, timeout=TIMEOUT, stream=True)
+            if r.status_code == 200:
+                buf = bytearray()
+                too_big = False
+                try:
+                    for chunk in r.iter_content(chunk_size=65536):
+                        if not chunk:
+                            continue
+                        buf.extend(chunk)
+                        if len(buf) > MAX_FETCH_BYTES:
+                            too_big = True
+                            break
+                finally:
+                    r.close()
+                if too_big:
+                    last_err = f"响应过大 (>{MAX_FETCH_BYTES // 1024 // 1024}MB)"
+                    last_kind = "响应过大"
+                else:
+                    text = bytes(buf).decode(r.encoding or "utf-8", errors="replace")
+                    if text.strip():
+                        content_type = r.headers.get("Content-Type", "")
+                        if host:
+                            _dead_host_ok(host)
+                        return text, url, content_type
+                    last_err = "空响应"
+                    last_kind = _classify_fetch_error("")
+            else:
+                r.close()
+                # 有 HTTP 响应 (哪怕 404/423) 说明 host 还活着: 只分类计数, 不计死域名。
+                last_err = f"HTTP {r.status_code}"
+                last_kind = _classify_fetch_error("", status=r.status_code)
         except Exception as e:  # noqa: BLE001
             last_err = f"{type(e).__name__}: {e}"
             last_kind = _classify_fetch_error(str(e))
@@ -816,9 +851,15 @@ def discover_tvbox(progress=None):
                               it.get("default_branch") or "main",
                               it.get("updated_at") or ""))
             _search_pace()
-    # code search 补一轮: 搜 tvbox.json / box.json 文件名 (需要 token, 未登录不可用)
+    # code search 补一轮: 搜 tvbox.json / box.json 文件名 (需要 token, 未登录不可用)。
+    # 2026-11-17 发现调研扩展: 再按内容搜 CMS 特征串 (api.php/provide/vod、
+    # vod_play_url、vod_name), 能挖到文件名不叫 tvbox.json 的配置 (如 LunaTV 类
+    # 清单、CMS 资源站)。code search 限流 10 次/分钟, 每问之间 _search_pace()。
     if _github_token() and not rate_limited and time.time() <= t_end and not _deadline_hit():
-        for q in ["tvbox.json in:path", "box.json in:path"]:
+        for q in ["tvbox.json in:path", "box.json in:path",
+                  "\"api.php/provide/vod\" extension:json",
+                  "\"vod_play_url\" extension:json",
+                  "\"vod_name\" extension:json"]:
             if rate_limited or time.time() > t_end or _deadline_hit():
                 break
             items, rate_limited = _github_search(q, "code", 1, 30, progress)
@@ -1135,6 +1176,14 @@ TVBOX_SOURCES = [
     {"name": "Lightconer/tvbox-ysc-config 单仓聚合.json",
      "owner": "Lightconer", "repo": "tvbox-ysc-config", "branch": "main",
      "path": "output/单仓聚合.json", "extra": []},
+    # --- 2026-11-17 发现调研并入: 多仓订阅 (Lightconer 每日两次更新, 最新鲜的聚合)
+    # 与 LunaTV-config (88 个 MacCMS api.php/provide/vod 端口, 最全的 CMS 清单) ---
+    {"name": "Lightconer/tvbox-ysc-config 多仓订阅.json",
+     "owner": "Lightconer", "repo": "tvbox-ysc-config", "branch": "main",
+     "path": "output/多仓订阅.json", "extra": []},
+    {"name": "hafrey1/LunaTV-config LunaTV-config.json (88 个 MacCMS 端口)",
+     "owner": "hafrey1", "repo": "LunaTV-config", "branch": "main",
+     "path": "LunaTV-config.json", "extra": []},
     {"name": "cluntop/tvbox box.json",
      "owner": "cluntop", "repo": "tvbox", "branch": "main",
      "path": "box.json", "extra": ["https://clun.top/box.json"]},
@@ -3414,23 +3463,34 @@ def _fetch_aoa_sources(progress=None):
         bundles.append({"name": name, "hash": h, "url": f"{AOA_BASE}/sources/{h}.json"})
 
     def _fetch_bundle(b):
+        # 2026-11-17 内存修复 (书源入口 OOM): 之前这里下载+全量解析每个
+        # bundle JSON (3,907 条) 并把全部 items 留在内存, 但调用方只用
+        # count/name/hash/url, 主循环还会重新拉一遍 —— 纯浪费, 且 4 并发
+        # 大 JSON 解析 (+strip_json_noise 逐字复制) 是书源入口 OOM 的主因。
+        # 现只数 bookSourceUrl 出现次数 (每条源恰好一个该键), 不解析、
+        # 不保留 items; 响应流式读、20MB 上限, 超限按失败处理。
         try:
-            rr = requests.get(b["url"], headers=AOA_HEADERS, timeout=30)
+            rr = requests.get(b["url"], headers=AOA_HEADERS, timeout=30, stream=True)
             if rr.status_code != 200:
                 return {**b, "count": 0, "items": [], "error": f"HTTP {rr.status_code}"}
-            data = json.loads(strip_json_noise(rr.text), strict=False)
-            if isinstance(data, dict):
-                lists = [v for v in data.values() if isinstance(v, list)]
-                data = lists[0] if lists else []
-            if not isinstance(data, list):
-                return {**b, "count": 0, "items": [], "error": "顶层不是数组"}
-            items = [x for x in data if isinstance(x, dict) and x.get("bookSourceUrl")]
-            return {**b, "count": len(items), "items": items, "error": ""}
+            buf = bytearray()
+            try:
+                for chunk in rr.iter_content(chunk_size=65536):
+                    if not chunk:
+                        continue
+                    buf.extend(chunk)
+                    if len(buf) > MAX_FETCH_BYTES:
+                        return {**b, "count": 0, "items": [],
+                                "error": f"响应过大 (>{MAX_FETCH_BYTES // 1024 // 1024}MB), 跳过"}
+            finally:
+                rr.close()
+            count = bytes(buf).decode("utf-8", errors="replace").count('"bookSourceUrl"')
+            return {**b, "count": count, "items": [], "error": ""}
         except Exception as e:  # noqa: BLE001
             return {**b, "count": 0, "items": [], "error": f"{type(e).__name__}: {e}"}
 
     results = []
-    with ThreadPoolExecutor(max_workers=4) as ex:
+    with ThreadPoolExecutor(max_workers=2) as ex:
         futs = {ex.submit(_fetch_bundle, b): b for b in bundles}
         for fut in as_completed(futs):
             try:
@@ -3997,6 +4057,7 @@ def fetch_books(data_dir, progress=None, extra_sources=None, discovery=None):
     # 最长静默 25 秒 (timeout), 此前 TVBox 一结束、书源第一行日志未出时
     # 看起来像"根本不走书源搜索", 先让入口可见。
     _log(progress, "[书源] 进入书源阶段: 先拉第二合集 aoaostar, 再抓上游")
+    _log_mem(progress, "进入书源阶段")
     # extra_sources 为发现阶段找到的新候选上游 (与固定清单走同一套流程)
     sources = list(LEGADO_SOURCES) + list(extra_sources or [])
     # ---- 第二书源合集 legado.aoaostar.com (2026-11-13 并入, 与 yck 并列) ----
@@ -4021,6 +4082,7 @@ def fetch_books(data_dir, progress=None, extra_sources=None, discovery=None):
         _log(progress, f"[书源] aoaostar 第二合集 {_aoa_total} 条 "
                        f"({len(_aoa_bundles)} 个 bundle, 女频专包 "
                        f"{next((b['count'] for b in _aoa_bundles if b['hash'] == AOA_FEMALE_BUNDLE_HASH), 0)} 条)")
+    _log_mem(progress, "aoaostar 合集拉完")
     out_dir = os.path.join(data_dir, "books")
     os.makedirs(out_dir, exist_ok=True)
     seen_urls = set()
@@ -4033,6 +4095,14 @@ def fetch_books(data_dir, progress=None, extra_sources=None, discovery=None):
     for _si, src in enumerate(sources):
         if _deadline_hit():
             _log(progress, "[书源] 超时预算, 停止继续抓上游, 用已抓到的收尾")
+            break
+        # 2026-11-17 内存防线: 每抓一个上游前查 RSS, 超过 MEM_LIMIT_MB
+        # (默认 420MB, 免费版上限 512MB) 即收尾写 partial —— 宁可少抓
+        # 几个源, 也不被平台 OOM 杀掉 (重启会清空无持久盘的 data/ 从头再来)。
+        _rss_now = _rss_mb()
+        if _rss_now is not None and _rss_now >= MEM_LIMIT_MB:
+            _log(progress, f"[内存] 书源抓取 RSS {_rss_now} MB 已达上限 "
+                           f"{MEM_LIMIT_MB} MB, 停止继续抓上游, 用已抓到的收尾")
             break
         _emit(progress, 6, (_si / max(1, len(sources))) * 0.6,
               f"正在抓 {src['name']}（第 {_si + 1}/{len(sources)} 个书源上游）",

@@ -28,7 +28,7 @@
 
 ### TVBox：80–150 站，目标 120，约 70% 热门 + 30% 偏门
 
-1. **候选池**：先抓 10 个固定上游（含 4 个偏门补充源）+ 自动发现的新候选上游（GitHub 搜索、免费搜索引擎、yck 聚合索引，见“自动发现新源”），去重后得到候选池（本次约数百站），不直接按 Star 取前几名。
+1. **候选池**：先抓 12 个固定上游（含 4 个偏门补充源）+ 自动发现的新候选上游（GitHub 搜索、免费搜索引擎、yck 聚合索引，见“自动发现新源”），去重后得到候选池（本次约数百站），不直接按 Star 取前几名。
 2. **第一轮实测**：对每个候选站的 `api` 做 HEAD/GET 计时——TTFB、总耗时、限 200KB 内下载算带宽（KB/s），CMS 站请求 `?ac=list` 看能否正常返回 vod 列表（正文含 `"list"` / `"class"` / `"vod` 等）。10 并发，每站超时 5 秒。
 3. **门槛**：TTFB 建议 `< 1.5s`、总耗时 `< 3s`、能返回 vod 列表，三项都过才算通过。国内 CDN / 域名加分：jsDelivr、`.cn` 域名、阿里云 / 腾讯云等国内云域名在排序时减分（相当于约 200ms 优势）。
 4. **第二、三轮复测**：分开取第一轮通过里热门前 110 名 + 偏门前 60 名复测（不只取全局速度前 160，否则偏门站会被热门站挤出复测池，导致 70/30 构成无偏门可选），两轮通过的再测第三轮，三轮都通过才算最终通过，延迟和带宽取三轮中较差的一次（保守计分），确认不是偶发快。
@@ -100,7 +100,7 @@ research/              调研报告 (TVBox / Legado, 含上游清单与格式说
 
 每轮抓取前（第 0 阶段）先联网搜索找新上游，而不是只靠写死的 `TVBOX_SOURCES` / `LEGADO_SOURCES`。发现 ≠ 收录：候选上游仍要走同一套格式校验、去重、受限内容过滤、速度/搜书实测，不合规照样淘汰；结果记在 `data/*/meta.json` 的 `discovered_upstreams`（名字、来源、是否通过筛选）。
 
-- **TVBox 发现**：GitHub 搜索 API 多关键词多页翻查（`tvbox`、`tvbox-config`、`tvbox源`、`tvbox配置`、`dianshi`、`电视源`、`tvbox config`、`tvbox json`，按最近更新排序，每词翻 2 页），跳过已在固定清单里的仓库和 fork；有 `GITHUB_TOKEN` 时再用 code search 补一轮（搜 `tvbox.json` / `box.json` 文件名）；再用免费公开搜索引擎补充——SearXNG 只固定用 2 个实例（`baresearch.org`、`searx.be`，通的那个才用，两个都不通就跳过，不再用 DuckDuckGo）；从搜索结果里解析 GitHub 仓库、raw/jsDelivr 直链，再探测常见配置文件路径（`tvbox.json`、`box.json`、`tvbox_recommended.json`、`jsm.json` 等），含 `sites` 数组才算候选。每轮最多 50 个 TVBox 候选。
+- **TVBox 发现**：GitHub 搜索 API 多关键词多页翻查（`tvbox`、`tvbox-config`、`tvbox源`、`tvbox配置`、`dianshi`、`电视源`、`tvbox config`、`tvbox json`，按最近更新排序，每词翻 2 页），跳过已在固定清单里的仓库和 fork；有 `GITHUB_TOKEN` 时再用 code search 补一轮（搜 `tvbox.json` / `box.json` 文件名，2026-11-17 起再加内容搜 `api.php/provide/vod`、`vod_play_url`、`vod_name`，能挖到文件名不叫 tvbox.json 的配置）；再用免费公开搜索引擎补充——SearXNG 只固定用 2 个实例（`baresearch.org`、`searx.be`，通的那个才用，两个都不通就跳过，不再用 DuckDuckGo）；从搜索结果里解析 GitHub 仓库、raw/jsDelivr 直链，再探测常见配置文件路径（`tvbox.json`、`box.json`、`tvbox_recommended.json`、`jsm.json` 等），含 `sites` 数组才算候选。每轮最多 50 个 TVBox 候选。固定上游 2026-11-17 起为 12 个：新增 Lightconer 多仓订阅（每日两次更新，最新鲜的聚合）与 LunaTV-config（88 个 MacCMS 端口，最全的 CMS 清单）。
 - **书源发现**：yck 聚合索引页（`/yuedu/shuyuans/index.html`）全量扫聚合 id，取最新聚合（Range 只取前 4KB 探针确认是 JSON 数组，不整文件下载，最多 10 个）；GitHub 多关键词搜索 `legado` 相关仓库（`legado`、`阅读书源`、`shuyuan`、`yuedu`、`book-source` 等），探测 `books.json` / `all.json` 等文件（含 `bookSourceUrl` 的条目 ≥ 20 才算数）；搜索引擎补充同上。每轮最多 30 个书源候选。
 - **上限与安全**：发现阶段最多 15 分钟，超时即停；全轮总预算 60 分钟（`FETCH_BUDGET_MINUTES` 可改），超时即收尾。GitHub 未登录搜索限流约 10 次/分钟，被限流（403/429）就记日志跳过搜索、用已找到的候选继续，绝不让整轮抓取失败；某个搜索引擎挂了同样跳过。开关：`DISCOVERY_ENABLED`，默认 `1` 开启，设 `0` 关闭。
 - **域名收敛（2026-11-13）**：发现阶段只碰已经允许过的域名（`github.com` / `api.github.com` / `raw.githubusercontent.com` / `cdn.jsdelivr.net`、yck 三个镜像站）+ 固定 2 个 SearXNG 实例；候选探测只用 jsDelivr + raw，不走 `ghproxy.net` 等新镜像站；新域名先收集起来一次过完校验再批量处理，不一个一个零散触发。注意：测速/搜书实测本身要访问各源站自己的域名（那是产品功能，不是发现），不在收敛范围内。
@@ -197,6 +197,8 @@ ACCESS_PASSWORD=你的密码 UPDATE_INTERVAL_DAYS=7 PORT=8000 python3 app.py
 - 恢复启动自动抓：启动时数据缺失或已过期就自动抓一次（从 0 开始抓是正常流程），之后每小时检查一次，到期再抓。前端“暂无数据请手动更新”的文案已删掉。
 - 保留上一轮中与重启前提无关的修复：控制字符 JSON（`strict=False`）、非 JSON 响应跳过、seed 去重、死域名缓存（`data/dead_hosts.json`，同一 host 网络层连续失败 3 次后 24 小时内跳过，HTTP 404/423 与“网络不可达”不计入）、内存日志、boot id、失败汇总。
 - “Failed service”在无重启前提下的可能解释（未定论）：部署失败、健康检查失败、或某轮抓取把进程拖垮后平台判失败。应用日志里没有 OOM 字样，用户那边 Render Events 里也没看到 OOM/137。下次若再出现，请去 Render Events 里看具体原因（OOM/137/健康检查失败），再结合启动日志的 boot id 与抓取中的内存日志（每轮开始、每阶段切换、TVBox 上游循环每 60 秒、每轮结束都打 `[内存] ... RSS x MB`，超 400MB 打 `[内存警告]`）定性。
+
+**2026-11-17 更新：书源入口重启，根因是 OOM（内存），已修复。** 用户日志：TVBox 完成 119 站后、`[书源] 进入书源阶段` 一出，实例立刻 `restarted`，新 boot 数据状态 none。注意这不是 11-16 那次的部署打断——同样的时间点（书源入口）第二次出现，就是书源阶段本身的问题。上次我说是部署打断，这个判断现在推翻了。证据链：TVBox 结束时 RSS 已 175.1MB（免费版上限 512MB 的 34%），书源入口第一步 `_fetch_aoa_sources` 并发（4 线程）下载+全量解析 7 个 aoaostar 合集（3,907 条），每个 bundle 还要过 `strip_json_noise` 逐字复制一遍多 MB 文本，然后把全部 items 留在内存——**而调用方只用 count/name/hash/url，主循环还会重新拉一遍，items 全是白占的**；4 并发大 JSON 解析就是压垮内存的那一下，容器被 OOM 杀掉（exit 137，应用日志里看不到，Render 只打一行 restarted），免费版无持久盘，重启后 data/ 全空，又从头重抓，TVBox→书源→OOM→重启，死循环。本次修复（fetcher.py）：① `_fetch_bundle` 改为只数条数（数 `"bookSourceUrl"` 出现次数），不解析、不保留 items，并发 4→2，响应流式读、20MB 上限；② `fetch_text` 全局流式读 + 20MB 上限（`MAX_FETCH_BYTES`，环境变量可调），超大响应按失败记“响应过大”，不再一次读进内存；③ 书源主循环每次抓上游前查 RSS，超过 420MB（`MEM_LIMIT_MB`，默认 420）即收尾写 partial，宁可少抓也不被平台杀掉；④ 书源入口与 aoaostar 拉完各加一行内存日志，下次重启看得到入口内存。验证：`python3 tests/test_books_oom_fix.py`（新，10 项：aoaostar 只计数且 items 为空、超大响应拒收、小响应正常、阈值常量）与三套旧测试全过。部署：拷 `fetcher.py`、`README.md`、`tests/test_fetch_loop_fixes.py`、`tests/test_books_oom_fix.py`（新增）进仓库再推，不用传 data/。
 
 重新部署步骤：把工作区改的文件拷进你的仓库再推（这边没有你的 git remote，推不了）：`app.py`、`fetcher.py`、`templates/index.html`、`README.md`、`tests/test_fetch_loop_fixes.py`、`tests/test_progress_persistence.py`、`tests/test_fetch_loop_v2.py`（新增）。Render 检测到推送自动重新部署。**这次不用传 data/，data/ 是输出、永远不进仓库。部署前先在旧版页面点「全部下载为 ZIP」备份一份数据**：免费版磁盘是临时的，重新部署/重启后容器内的数据会丢失，服务启动后会自动从 0 重抓（约 20–60 分钟）。
 
