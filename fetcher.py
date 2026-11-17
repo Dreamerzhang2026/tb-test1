@@ -2891,6 +2891,30 @@ LEGADO_SOURCES = [
     {"name": "cjj200011222/legado-booksource all.json",
      "urls": ["https://cdn.jsdelivr.net/gh/cjj200011222/legado-booksource@master/all.json",
               "https://raw.githubusercontent.com/cjj200011222/legado-booksource/master/all.json"]},
+    # 12yue.de5.net 书源合集 (2026-11-16 用户提供: 该站 cy/书源.json 列出的
+    # 7 个 yuedu520/yuedu Legado 合集, 与 yck/aoaostar 并列的第三合集)。
+    # 每个合集双通道: gcore.jsdelivr.net (站方原链) + cdn.jsdelivr.net (备用)。
+    {"name": "12yue 综合 2159 书源",
+     "urls": ["https://gcore.jsdelivr.net/gh/yuedu520/yuedu/250422.json",
+              "https://cdn.jsdelivr.net/gh/yuedu520/yuedu/250422.json"]},
+    {"name": "12yue 番茄小说书源",
+     "urls": ["https://gcore.jsdelivr.net/gh/yuedu520/yuedu/250410.json",
+              "https://cdn.jsdelivr.net/gh/yuedu520/yuedu/250410.json"]},
+    {"name": "12yue 69书源(起点)",
+     "urls": ["https://gcore.jsdelivr.net/gh/yuedu520/yuedu/250412.json",
+              "https://cdn.jsdelivr.net/gh/yuedu520/yuedu/250412.json"]},
+    {"name": "12yue 超级精品 997 书源",
+     "urls": ["https://gcore.jsdelivr.net/gh/yuedu520/yuedu/250415.json",
+              "https://cdn.jsdelivr.net/gh/yuedu520/yuedu/250415.json"]},
+    {"name": "12yue 三五中文网书源",
+     "urls": ["https://gcore.jsdelivr.net/gh/yuedu520/yuedu/250416.json",
+              "https://cdn.jsdelivr.net/gh/yuedu520/yuedu/250416.json"]},
+    {"name": "12yue 漫画 83 书源",
+     "urls": ["https://gcore.jsdelivr.net/gh/yuedu520/yuedu/250424.json",
+              "https://cdn.jsdelivr.net/gh/yuedu520/yuedu/250424.json"]},
+    {"name": "12yue 听书 49 书源",
+     "urls": ["https://gcore.jsdelivr.net/gh/yuedu520/yuedu/2504241.json",
+              "https://cdn.jsdelivr.net/gh/yuedu520/yuedu/2504241.json"]},
 ]
 
 
@@ -3969,6 +3993,10 @@ def _domain_of_source(it):
 
 
 def fetch_books(data_dir, progress=None, extra_sources=None, discovery=None):
+    # 书源阶段入口立即打一行日志 (2026-11-16 补): aoaostar 首页抓取本身
+    # 最长静默 25 秒 (timeout), 此前 TVBox 一结束、书源第一行日志未出时
+    # 看起来像"根本不走书源搜索", 先让入口可见。
+    _log(progress, "[书源] 进入书源阶段: 先拉第二合集 aoaostar, 再抓上游")
     # extra_sources 为发现阶段找到的新候选上游 (与固定清单走同一套流程)
     sources = list(LEGADO_SOURCES) + list(extra_sources or [])
     # ---- 第二书源合集 legado.aoaostar.com (2026-11-13 并入, 与 yck 并列) ----
