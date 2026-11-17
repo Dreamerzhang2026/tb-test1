@@ -45,6 +45,17 @@ pre.log{background:#020617;border:1px solid #334155;border-radius:10px;padding:1
 .logtime{color:#64748b}
 .muted{color:#94a3b8;font-size:13px;line-height:1.6}
 .hidden{display:none}
+.tfolder{display:flex;align-items:center;gap:8px;padding:11px 4px;border-bottom:1px solid #334155;cursor:pointer}
+.tfolder:hover{background:#16233a}
+.tfolder .tname{font-weight:600;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tfolder .tarrow{color:#94a3b8;width:14px;flex:none;text-align:center}
+.tfile{display:flex;align-items:center;gap:8px;padding:8px 4px;border-bottom:1px solid #1e293b;font-size:14px}
+.tfile .tname{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tsize{color:#94a3b8;font-size:13px;white-space:nowrap}
+.ttime{color:#94a3b8;font-size:13px;white-space:nowrap}
+.tdl{color:#38bdf8;text-decoration:none;white-space:nowrap;font-size:14px}
+.tzip{background:transparent;border:1px solid #475569;color:#e2e8f0;border-radius:8px;padding:6px 10px;font-size:13px;cursor:pointer;white-space:nowrap}
+.tzip:hover{border-color:#38bdf8}
 </style>
 </head>
 <body>
@@ -90,9 +101,8 @@ pre.log{background:#020617;border:1px solid #334155;border-radius:10px;padding:1
 
     <div class="card">
       <h2 style="font-size:17px;margin:0">文件列表</h2>
-      <table><thead><tr><th>文件</th><th>大小</th><th>更新时间</th><th></th></tr></thead>
-      <tbody id="fileRows"><tr><td colspan="4" class="muted">加载中…</td></tr></tbody></table>
-      <p class="muted">tvbox.json 直接导入 TVBox 使用；books.json 直接导入阅读 App（Legado）使用；meta.json 记录每个上游的抓取结果。“全部下载为 ZIP”里还含 tvbox/assets/ 下的依赖包（spider jar 与 type-3 站的 api/ext 文件，供本地/离线备份；json 里的远程 URL 不动，TVBox 仍远程加载）。</p>
+      <div id="fileTree"><p class="muted">加载中…</p></div>
+      <p class="muted">点文件夹名展开/折叠，点「下载 ZIP」把整个文件夹打成压缩包下载。tvbox.json 直接导入 TVBox 使用；books.json 直接导入阅读 App（Legado）使用；meta.json 记录每个上游的抓取结果。依赖包（tvbox/assets/）是 spider jar 与 type-3 站的 api/ext 文件，供本地/离线备份；json 里的远程 URL 不动，TVBox 仍远程加载。</p>
     </div>
   </div>
 </div>
@@ -104,7 +114,7 @@ function fmtSize(n){if(n<1024)return n+' B';if(n<1048576)return (n/1024).toFixed
 async function api(path,opt){const r=await fetch(path,opt);if(r.status===401){showLogin();throw new Error('未登录')}return r}
 async function refresh(){
   try{
-    const s=await (await api('/api/status')).json();
+    const s=await (await api('api/status')).json();
     document.getElementById('tvCount').textContent=fmt(s.tvbox_sites)+(s.adult_sites!=null?'（B 套 '+s.adult_sites+' 站）':'');
     document.getElementById('bookCount').textContent=fmt(s.book_sources);
     document.getElementById('lastUpd').textContent=fmtTime(s.last_update);
@@ -126,30 +136,81 @@ async function refresh(){
       const _fe=Object.entries(s.fetch_error).map(([k,v])=>k+': '+v).join('；');
       document.getElementById('updHint').textContent='上次抓取部分失败：'+_fe+'。已抓到的数据仍可下载；想重试请点「手动更新抓取」。';
     }
-    const f=await (await api('/api/files')).json();
-    const rows=(f.files||[]).map(x=>{
-      const dl=x.name.startsWith('tvbox/assets/')?'assets-'+x.name.split('/').pop():x.name==='tvbox/tvbox.json'?'tvbox.json':x.name==='tvbox/tvbox_b.json'?'tvbox-b.json':x.name==='books/books.json'?'books.json':x.name==='tvbox/meta.json'?'tvbox-meta.json':x.name==='books/meta.json'?'books-meta.json':'status.json';
-      const disp=x.name==='tvbox/tvbox_b.json'?x.name+'（B 套）':x.name;
-      return `<tr><td>${disp}</td><td>${fmtSize(x.size)}</td><td>${fmtTime(x.mtime)}</td><td><a class="dl" href="/api/download/${dl}">下载</a></td></tr>`;
-    }).join('')||'<tr><td colspan="4">暂无文件，正在自动抓取，抓完会显示在这里</td></tr>';
-    document.getElementById('fileRows').innerHTML=rows;
+    const f=await (await api('api/files')).json();
+    lastFiles=f.files||[];
+    renderFileTree();
     fetchUpdateStatus(); // 登录后立即显示上次抓取状态 (进行中/中断/已完成)
     if(s.updating) startPolling(); else stopPolling();
   }catch(e){/* 已回登录页 */}
 }
+// ---------- 文件列表: 文件夹-文件树 (2026-11-17) ----------
+// 后端 /api/files 仍返回扁平列表, 前端按路径分组成树; 折叠状态存在内存里,
+// 刷新/轮询重渲染时保持不变。依赖包文件多, 默认折叠。
+let lastFiles=[];
+const FOLDER_LABELS={'tvbox':'TVBox 源','books':'书源','tvbox/assets':'依赖包'};
+const collapsedFolders=new Set(['tvbox/assets']);
+function fileDl(x){
+  if(x.name.startsWith('tvbox/assets/'))return 'assets-'+x.name.split('/').pop();
+  return {'tvbox/tvbox.json':'tvbox.json','tvbox/tvbox_b.json':'tvbox-b.json','books/books.json':'books.json','tvbox/meta.json':'tvbox-meta.json','books/meta.json':'books-meta.json'}[x.name]||'status.json';
+}
+function fileDisp(x){
+  const base=x.name.split('/').pop();
+  return x.name==='tvbox/tvbox_b.json'?base+'（B 套）':base;
+}
+function buildTree(files){
+  const root={path:'',children:{},files:[]};
+  (files||[]).forEach(x=>{
+    const parts=x.name.split('/');
+    let node=root;
+    for(let i=0;i<parts.length-1;i++){
+      const p=parts.slice(0,i+1).join('/');
+      node.children[parts[i]]=node.children[parts[i]]||{name:parts[i],path:p,children:{},files:[]};
+      node=node.children[parts[i]];
+    }
+    node.files.push(x);
+  });
+  return root;
+}
+function treeSize(n){let s=0;n.files.forEach(f=>s+=f.size||0);Object.values(n.children).forEach(c=>s+=treeSize(c));return s}
+function treeCount(n){let s=n.files.length;Object.values(n.children).forEach(c=>s+=treeCount(c));return s}
+function renderFilesHtml(files,pad){
+  return files.map(x=>'<div class="tfile" style="padding-left:'+pad+'px"><span class="tname">📄 '+fileDisp(x)+'</span><span class="tsize">'+fmtSize(x.size)+'</span><span class="ttime">'+fmtTime(x.mtime)+'</span><a class="tdl" href="api/download/'+fileDl(x)+'">下载</a></div>').join('');
+}
+function renderNodeHtml(node,pad){
+  let html='';
+  Object.values(node.children).forEach(ch=>{
+    const isCol=collapsedFolders.has(ch.path);
+    const label=FOLDER_LABELS[ch.path]||ch.path;
+    html+='<div class="tfolder" style="padding-left:'+pad+'px" onclick="toggleFolder(\''+ch.path+'\')"><span class="tarrow">'+(isCol?'▶':'▼')+'</span><span class="tname">📁 '+label+' <span class="muted">('+ch.path+'/ · '+treeCount(ch)+' 个文件)</span></span><span class="tsize">'+fmtSize(treeSize(ch))+'</span><button class="tzip" onclick="event.stopPropagation();downloadDir(\''+ch.path+'\')">⬇️ 下载 ZIP</button></div>';
+    if(!isCol){
+      html+=renderFilesHtml(ch.files,pad+24);
+      html+=renderNodeHtml(ch,pad+24);
+    }
+  });
+  return html;
+}
+function renderFileTree(){
+  if(!lastFiles.length){document.getElementById('fileTree').innerHTML='<p class="muted">暂无文件，正在自动抓取，抓完会显示在这里</p>';return}
+  const root=buildTree(lastFiles);
+  let html=renderNodeHtml(root,4);
+  html+=renderFilesHtml(root.files,4); // 根目录文件 (如 status.json)
+  document.getElementById('fileTree').innerHTML=html;
+}
+function toggleFolder(p){if(collapsedFolders.has(p))collapsedFolders.delete(p);else collapsedFolders.add(p);renderFileTree();}
+function downloadDir(p){window.location='api/download-dir/'+p;}
 function showLogin(){document.getElementById('loginCard').classList.remove('hidden');document.getElementById('mainCard').classList.add('hidden')}
 function showMain(){document.getElementById('loginCard').classList.add('hidden');document.getElementById('mainCard').classList.remove('hidden')}
 async function login(){
   const pwd=document.getElementById('pwd').value;
-  const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pwd})});
+  const r=await fetch('api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pwd})});
   if(r.ok){document.getElementById('loginErr').textContent='';showMain();refresh();}
-  else{document.getElementById('loginErr').textContent='密码错误，请重试';}
+  else{let m='密码错误，请重试';try{const j=await r.json();if(j&&j.error)m=j.error}catch(e){} if(r.status===404)m='登录接口 404：反代没把 /tvbox/api/login 转到应用，请检查 nginx 配置'; if(r.status===429)m='尝试过多，请 10 分钟后再试'; document.getElementById('loginErr').textContent=m;}
 }
-async function logout(){await fetch('/api/logout',{method:'POST'});showLogin()}
-function downloadAll(){window.location='/api/download-all'}
+async function logout(){await fetch('api/logout',{method:'POST'});showLogin()}
+function downloadAll(){window.location='api/download-all'}
 async function triggerUpdate(){
   const b=document.getElementById('updBtn');b.disabled=true;
-  const r=await fetch('/api/update',{method:'POST'});
+  const r=await fetch('api/update',{method:'POST'});
   const j=await r.json();
   if(!r.ok){document.getElementById('progBox').classList.remove('hidden');document.getElementById('progState').textContent=j.error||'更新失败';b.disabled=false;return}
   document.getElementById('progBox').classList.remove('hidden');
@@ -230,7 +291,7 @@ function renderUpdate(j){
   if(!j.running){stopPolling()}
 }
 async function fetchUpdateStatus(){
-  try{const j=await (await api('/api/update/status')).json();renderUpdate(j);return j}
+  try{const j=await (await api('api/update/status')).json();renderUpdate(j);return j}
   catch(e){return null}
 }
 async function pollUpdate(){
@@ -241,7 +302,7 @@ async function pollUpdate(){
 }
 document.getElementById('pwd').addEventListener('keydown',e=>{if(e.key==='Enter')login()});
 refresh().then(()=>{/* 若已登录会显示主界面 */}).catch(()=>{});
-(async()=>{try{const s=await (await fetch('/api/status')).json();if(s.ok){showMain();refresh()}}catch(e){}})();
+(async()=>{try{const s=await (await fetch('api/status')).json();if(s.ok){showMain();refresh()}}catch(e){}})();
 </script>
 </body>
 </html>

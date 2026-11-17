@@ -66,7 +66,7 @@
 - 偏门分类按书源名/分组/URL 匹配：轻小说、二次元/同人、武侠/仙侠、科幻、悬疑/推理、历史/军事、言情/女频、玄幻/奇幻、儿童/少儿、体育/游戏。热门大站指番茄、起点、七猫、笔趣阁、纵横、掌阅、咪咕等。
 - 偏门也要过同样的规则、官网、3 本书搜索抽查，搜不到书的一样剔除。入选的偏门清单见 `data/books/meta.json` 的 `niche_kept`。
 - 网页：未登录只显示密码框；密码正确后（服务端 session，密码不写进前端 JS）显示上次 / 下次更新、站点数、书源数、文件列表、单个下载、全部打包 ZIP 下载、手动更新（轮询 `/api/update/status` 实时显示步骤和日志）。
-- API：`POST /api/login`、`GET /api/status`、`GET /api/files`、`GET /api/download/<name>`、`GET /api/download-all`、`POST /api/update`、`GET /api/update/status`。正在抓取时重复触发会返回 409。
+- API：`POST /api/login`、`GET /api/status`、`GET /api/files`、`GET /api/download/<name>`、`GET /api/download-all`、`GET /api/download-dir/<tvbox|books|tvbox/assets>`（文件夹打包下载）、`POST /api/update`、`GET /api/update/status`。正在抓取时重复触发会返回 409。
 
 ## 目录结构
 
@@ -304,7 +304,7 @@ git push -u origin main
 
 1. 打开部署地址，输入访问密码登录。
 2. 首页显示 TVBox 站点数、书源数、上次 / 下次更新时间。
-3. 文件列表可单个下载：`tvbox.json` 导入 TVBox，`books.json` 导入阅读 App（Legado）。
+3. 文件列表按文件夹展示（TVBox 源 / 书源 / 依赖包，可展开折叠，依赖包默认折叠），文件可单个下载：`tvbox.json` 导入 TVBox，`books.json` 导入阅读 App（Legado）；点文件夹后的「下载 ZIP」会把该文件夹打成压缩包下载（`GET /api/download-dir/<tvbox|books|tvbox/assets>`）。
 4. “全部下载为 ZIP”会把整个 `data/` 文件夹打包成 `tvbox-legado-sources-YYYYMMDD.zip` 下载。
 5. “手动更新抓取”会重新从上游抓取，下方实时显示步骤日志（正在抓 XX、已完成、成功/失败数）。
 

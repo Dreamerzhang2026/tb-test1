@@ -133,10 +133,20 @@ def test_dead_host_cache():
     calls = {"n": 0}
 
     class FakeResp:
+        # 2026-11-17: fetch_text 改为流式读, FakeResp 需支持 iter_content/close。
         def __init__(self, status=200, text="{}", ctype="application/json"):
             self.status_code = status
             self.text = text
             self.headers = {"Content-Type": ctype}
+            self.encoding = "utf-8"
+
+        def iter_content(self, chunk_size=65536):
+            data = self.text.encode("utf-8")
+            for i in range(0, len(data), chunk_size):
+                yield data[i:i + chunk_size]
+
+        def close(self):
+            pass
 
     class FakeTimeout(Exception):
         pass

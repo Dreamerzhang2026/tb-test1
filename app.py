@@ -609,6 +609,59 @@ def api_download_all():
                      mimetype="application/zip")
 
 
+def _zip_assets(z, prefix):
+    """把 DATA_DIR/tvbox/assets/ 下的依赖包打进 zip (prefix 为 zip 内路径前缀)。
+    检查点 checkpoint_*.json 与 .tmp 不打进去, 与 download-all 一致。"""
+    assets_dir = os.path.join(DATA_DIR, "tvbox", "assets")
+    if not os.path.isdir(assets_dir):
+        return
+    for fn in sorted(os.listdir(assets_dir)):
+        fp = os.path.join(assets_dir, fn)
+        if os.path.isfile(fp) and not fn.endswith(".tmp"):
+            z.write(fp, f"{prefix}{fn}")
+
+
+# 文件夹打包下载 (2026-11-17 用户要求: 文件列表按文件夹展示,
+# 点文件夹就把该文件夹打成压缩包下载)。只允许这三个固定文件夹,
+# 其余路径一律 404, 不接受用户传入的任意路径。
+DOWNLOAD_DIRS = {
+    "tvbox": "tvbox",
+    "books": "books",
+    "tvbox/assets": "tvbox-assets",
+}
+
+
+@app.route("/api/download-dir/<path:dirname>")
+def api_download_dir(dirname):
+    if not _authed():
+        return jsonify({"ok": False, "error": "未登录"}), 401
+    if dirname not in DOWNLOAD_DIRS:
+        abort(404)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        if dirname == "tvbox":
+            # TVBox 文件夹: json 放 zip 根目录, 依赖包放 assets/ 子目录
+            for rel in ["tvbox/tvbox.json", "tvbox/tvbox_b.json",
+                        "tvbox/meta.json", "tvbox/failures.json"]:
+                full = _resolve(rel)
+                if os.path.exists(full):
+                    z.write(full, os.path.basename(rel))
+            _zip_assets(z, "assets/")
+        elif dirname == "books":
+            for rel in ["books/books.json", "books/meta.json"]:
+                full = _resolve(rel)
+                if os.path.exists(full):
+                    z.write(full, os.path.basename(rel))
+        elif dirname == "tvbox/assets":
+            # 依赖包文件夹: jar 等文件直接放 zip 根目录
+            _zip_assets(z, "")
+    buf.seek(0)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    return send_file(buf, as_attachment=True,
+                     download_name=f"{DOWNLOAD_DIRS[dirname]}-{stamp}.zip",
+                     mimetype="application/zip")
+
+
 @app.route("/api/update", methods=["POST"])
 def api_update():
     if not _authed():
